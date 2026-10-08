@@ -1,0 +1,11 @@
+{
+  // Sổ Công Trình — phần mềm kế toán & bóc tách chi phí công trình (độc lập, không dùng chung dữ liệu với hệ thống khác).
+  // Toàn bộ dữ liệu nằm trong 1 Durable Object dùng SQLite (tự tạo khi deploy, không cần tạo D1/R2/KV trước).
+  "name": "so-cong-trinh",
+  "main": "src/worker.js",
+  "compatibility_date": "2025-09-01",
+  "assets": { "directory": "./public/", "binding": "ASSETS", "run_worker_first": ["/api/*"] },
+  "durable_objects": { "bindings": [{ "name": "SO", "class_name": "SoCongTrinh" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SoCongTrinh"] }],
+  "observability": { "enabled": true }
+}

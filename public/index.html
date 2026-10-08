@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#0f3d3e">
+<title>Sổ Công Trình</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar" id="topbar" hidden>
+  <button class="icon-btn" id="menuBtn" aria-label="Mở menu">☰</button>
+  <div class="brand"><span class="logo">SCT</span><span id="companyName">Sổ Công Trình</span></div>
+  <div class="who" id="who"></div>
+</header>
+<div class="layout">
+  <nav class="sidebar" id="sidebar" hidden></nav>
+  <main id="main" class="main"><div class="loading">Đang tải…</div></main>
+</div>
+<div class="modal-back" id="modalBack" hidden>
+  <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal-head"><h2 id="modalTitle"></h2><button class="icon-btn" id="modalClose" aria-label="Đóng">✕</button></div>
+    <div class="modal-body" id="modalBody"></div>
+  </div>
+</div>
+<div class="toast" id="toast" hidden></div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
