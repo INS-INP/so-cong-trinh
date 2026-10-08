@@ -7,7 +7,7 @@ import { App } from '../src/app.js';
 
 const app = new App(nodeDb(), process.env.TODAY ? { now: () => Date.parse(process.env.TODAY + 'T03:00:00Z') } : {});
 const PUB = new URL('../public/', import.meta.url).pathname;
-const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
+const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.webmanifest': 'application/manifest+json' };
 http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   if (url.pathname.startsWith('/api/')) {

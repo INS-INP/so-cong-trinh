@@ -16,6 +16,7 @@ Phần mềm kế toán và bóc tách chi phí cho công ty thi công. Chạy t
 - **Công nợ**: phải trả từng NCC, phải thu từng công trình, **bảng đối chiếu với INSOLAR theo tháng** (so số với INSOLAR mà không nối hai hệ thống).
 - **Nhật ký thao tác**: ai làm gì, lúc nào, trước/sau.
 - Xuất Excel (CSV), in/PDF báo cáo. Dùng tốt trên điện thoại.
+- **Cài như ứng dụng (PWA)**: menu "Cài ứng dụng lên máy" hướng dẫn cho iPhone (Safari → Chia sẻ → Thêm vào MH chính), Android và máy tính. Khoá phóng to khi dùng trên điện thoại.
 
 ## Vai trò
 | Vai trò | Quyền |

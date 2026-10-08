@@ -153,13 +153,14 @@ const NAV = [
   { sep: true },
   { href: '#/doi-tac', label: 'Nhà cung cấp & khách', roles: ['quan_tri', 'ke_toan'] },
   { href: '#/cai-dat', label: 'Cài đặt & người dùng', roles: ['quan_tri'] },
+  { href: '#/cai-ung-dung', label: 'Cài ứng dụng lên máy', roles: ['quan_tri', 'ke_toan', 'chi_huy', 'co_dong'], install: true },
   { href: '#/tai-khoan', label: 'Đổi mật khẩu', roles: ['quan_tri', 'ke_toan', 'chi_huy', 'co_dong'] },
   { href: '#/dang-xuat', label: 'Đăng xuất', roles: ['quan_tri', 'ke_toan', 'chi_huy', 'co_dong'] },
 ];
 let pendingCount = 0;
 function renderNav() {
   const hash = location.hash || '#/';
-  $('#sidebar').innerHTML = NAV.filter(n => n.sep || n.roles.includes(role())).map(n => n.sep ? '<div class="sep"></div>' :
+  $('#sidebar').innerHTML = NAV.filter(n => n.sep || (n.roles.includes(role()) && (!n.install || !isStandalone()))).map(n => n.sep ? '<div class="sep"></div>' :
     `<a href="${n.href}" class="${(hash === n.href || (n.href !== '#/' && hash.startsWith(n.href))) ? 'active' : ''}"><span>${esc(n.label)}</span>${n.badge && pendingCount ? `<span class="badge">${pendingCount}</span>` : ''}</a>`).join('');
 }
 $('#menuBtn').addEventListener('click', () => $('#sidebar').classList.toggle('open'));
@@ -188,6 +189,7 @@ const ROUTES = [
   [/^#\/doi-tac$/, pagePartners],
   [/^#\/cai-dat$/, pageSettings],
   [/^#\/tai-khoan$/, pageAccount],
+  [/^#\/cai-ung-dung$/, pageInstall],
   [/^#\/dang-xuat$/, doLogout],
 ];
 async function route() {
@@ -951,6 +953,46 @@ async function pageAccount(main) {
     if (v.new_password !== v.new_password2) throw new Error('Hai lần nhập mật khẩu mới không giống nhau');
     await api('POST', '/api/me/password', v); f.reset(); toast('Đã đổi mật khẩu');
   }); });
+}
+
+// ---------- Ứng dụng cài trên máy (PWA) + khoá phóng to ----------
+const isStandalone = () => window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+let installEvent = null;
+window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); installEvent = e; });
+window.addEventListener('appinstalled', () => { installEvent = null; toast('Đã cài Sổ Công Trình lên máy'); if (S.boot) renderNav(); });
+if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+
+// iPhone/iPad bỏ qua user-scalable=no → chặn thêm cử chỉ chụm 2 ngón và chạm đúp.
+['gesturestart', 'gesturechange', 'gestureend'].forEach(ev => document.addEventListener(ev, (e) => e.preventDefault(), { passive: false }));
+document.addEventListener('touchmove', (e) => { if (e.touches.length > 1) e.preventDefault(); }, { passive: false });
+let lastTouchEnd = 0;
+document.addEventListener('touchend', (e) => {
+  const now = Date.now();
+  if (now - lastTouchEnd < 300 && !e.target.closest('input, textarea, select')) e.preventDefault();
+  lastTouchEnd = now;
+}, { passive: false });
+
+async function pageInstall(main) {
+  const ua = navigator.userAgent;
+  const ios = /iPhone|iPad|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const iosOther = ios && /CriOS|FxiOS|EdgiOS/.test(ua);
+  main.innerHTML = `<div class="page-head"><div><h1>Cài ứng dụng lên máy</h1><p class="muted">Cài một lần, sau đó mở Sổ Công Trình từ biểu tượng trên màn hình như ứng dụng thường, toàn màn hình, không thanh địa chỉ.</p></div></div>
+    <div class="card">
+      ${isStandalone() ? '<div class="notice ok">Bạn đang dùng bản đã cài.</div>' : ''}
+      ${installEvent ? '<p><button class="btn primary" id="doInstall">Cài ứng dụng ngay</button></p>' : ''}
+      ${ios ? `<h2>iPhone / iPad</h2>
+        ${iosOther ? '<div class="notice">Hãy mở trang này bằng <b>Safari</b> để cài được.</div>' : ''}
+        <ol><li>Mở trang này bằng <b>Safari</b>.</li><li>Bấm nút <b>Chia sẻ</b> (ô vuông có mũi tên lên) ở thanh dưới.</li><li>Chọn <b>Thêm vào MH chính</b> (Add to Home Screen), bấm <b>Thêm</b>.</li><li>Mở biểu tượng <b>Sổ Công Trình</b> trên màn hình chính.</li></ol>`
+      : `<h2>Android (Chrome)</h2><ol><li>${installEvent ? 'Bấm nút <b>Cài ứng dụng ngay</b> ở trên.' : 'Bấm menu <b>⋮</b> góc trên bên phải Chrome.'}</li>${installEvent ? '' : '<li>Chọn <b>Cài đặt ứng dụng</b> (hoặc <b>Thêm vào màn hình chính</b>).</li>'}<li>Mở biểu tượng <b>Sổ Công Trình</b> trên màn hình.</li></ol>
+        <h2>Máy tính (Chrome / Edge)</h2><p>${installEvent ? 'Bấm <b>Cài ứng dụng ngay</b> ở trên' : 'Bấm biểu tượng cài đặt (màn hình có mũi tên) ở cuối thanh địa chỉ'}, rồi chọn <b>Cài đặt</b>.</p>`}
+      <p class="small muted">Ứng dụng luôn lấy số liệu trực tiếp từ máy chủ và tự cập nhật bản mới, không phải cài lại.</p>
+    </div>`;
+  $('#doInstall')?.addEventListener('click', async () => {
+    if (!installEvent) return;
+    installEvent.prompt();
+    await installEvent.userChoice.catch(() => null);
+    installEvent = null; route();
+  });
 }
 
 start();
