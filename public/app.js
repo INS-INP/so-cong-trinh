@@ -146,9 +146,13 @@ const NAV = [
   { href: '#/cong-trinh', label: 'Công trình', roles: ['quan_tri', 'ke_toan', 'co_dong'] },
   { href: '#/doanh-thu', label: 'Doanh thu & thu tiền', roles: ['quan_tri', 'ke_toan', 'co_dong'] },
   { href: '#/cong-no', label: 'Công nợ & trả NCC', roles: ['quan_tri', 'ke_toan', 'co_dong'] },
+  { href: '#/tam-ung', label: 'Tạm ứng', roles: ['quan_tri', 'ke_toan', 'co_dong', 'chi_huy'] },
   { sep: true },
   { href: '#/bao-cao', label: 'Báo cáo tháng', roles: ['quan_tri', 'ke_toan', 'co_dong'] },
   { href: '#/so-nhat-ky', label: 'Sổ nhật ký (TT133)', roles: ['quan_tri', 'ke_toan', 'co_dong'] },
+  { href: '#/thue', label: 'Thuế & bảng kê', roles: ['quan_tri', 'ke_toan', 'co_dong'] },
+  { href: '#/so-cai', label: 'Cân đối & sổ cái, sổ quỹ', roles: ['quan_tri', 'ke_toan', 'co_dong'] },
+  { href: '#/but-toan', label: 'Bút toán khác & số dư đầu kỳ', roles: ['quan_tri', 'ke_toan', 'co_dong'] },
   { href: '#/nhat-ky', label: 'Nhật ký thao tác', roles: ['quan_tri', 'ke_toan', 'co_dong'] },
   { sep: true },
   { href: '#/doi-tac', label: 'Nhà cung cấp & khách', roles: ['quan_tri', 'ke_toan'] },
@@ -190,6 +194,10 @@ const ROUTES = [
   [/^#\/cai-dat$/, pageSettings],
   [/^#\/tai-khoan$/, pageAccount],
   [/^#\/cai-ung-dung$/, pageInstall],
+  [/^#\/tam-ung$/, pageAdvances],
+  [/^#\/thue$/, pageTax],
+  [/^#\/so-cai$/, pageTrial],
+  [/^#\/but-toan$/, pageJournals],
   [/^#\/dang-xuat$/, doLogout],
 ];
 async function route() {
@@ -290,6 +298,7 @@ async function pageDashboard(main) {
   if (d.chi_huy) {
     main.innerHTML = `<div class="page-head"><div><h1>Xin chào, ${esc(me().full_name)}</h1><p class="muted">Nhập chi phí công trình kèm ảnh chứng từ. Kế toán hoặc cổ đông sẽ duyệt.</p></div>
       <div class="actions"><button class="btn primary" id="btnAddCost">+ Nhập chi phí</button><button class="btn" id="btnXml">Nhập hoá đơn XML</button></div></div>
+      ${d.advance ? `<div class="kpis"><div class="kpi"><div class="l">Tiền tạm ứng còn giữ</div><div class="v">${fmt(d.advance.balance)}</div><div class="l">${d.advance.pending ? 'Đang chờ duyệt chi: ' + fmt(d.advance.pending) : ''}</div></div></div>` : ''}
       <div class="card"><h2>Khoản bạn đã nhập đang chờ duyệt</h2>${pendingHtml}</div>`;
   } else {
     const r = d.report;
@@ -315,29 +324,57 @@ function bindCommon(root) {
 }
 
 // ---------- Chi phí ----------
+const EVIDENCE_HINT = {
+  hoa_don_gtgt: 'Đính kèm ảnh/PDF hoá đơn GTGT (hoặc dùng "Nhập hoá đơn XML" để tự đọc).',
+  hoa_don_ban_hang: 'Đính kèm hoá đơn bán hàng. Không có thuế GTGT được khấu trừ.',
+  bang_ke: 'Mua của người bán lẻ/hộ không có hoá đơn (cát, đá, dây buộc…): chụp giấy biên nhận có họ tên, địa chỉ, chữ ký người bán (kèm CCCD nếu có). Khoản này tự lên Bảng kê 01/TNDN, vẫn được tính chi phí.',
+  nhan_cong_khoan: 'Thuê thợ cá nhân không có hoá đơn: chụp hợp đồng khoán + biên nhận tiền (ký tên) + CCCD. Lần trả từ 2 triệu tự khấu trừ 10% thuế TNCN, trừ khi người lao động có cam kết mẫu 08/CK-TNCN.',
+  noi_bo: 'Chứng từ nội bộ: bảng lương có ký nhận, phiếu chi, quyết định… ',
+  khong_hop_le: 'Không có chứng từ hợp lệ: vẫn ghi để quản lý tiền, nhưng KHÔNG được trừ khi tính thuế TNDN. Vẫn phải chụp ảnh bằng chứng (tin nhắn, ảnh chụp…).',
+};
+async function quickPartner(selectEl, needPersonal) {
+  const name = prompt(needPersonal ? 'Họ tên người bán / người nhận tiền:' : 'Tên nhà cung cấp / người nhận:');
+  if (!name) return;
+  const address = prompt('Địa chỉ:') || '';
+  const id_no = needPersonal ? (prompt('Số CCCD (để lên bảng kê):') || '') : '';
+  const mst = needPersonal ? '' : (prompt('Mã số thuế (bỏ trống nếu không có):') || '');
+  try {
+    const r = await api('POST', '/api/partners', { kind: 'ncc', name, mst, address, id_no });
+    S.boot.partners.push({ id: r.id, kind: 'ncc', name, mst, address, id_no });
+    selectEl.innerHTML = partnerOptions(r.id, '— Không có / chọn —');
+  } catch (err) { toast(err.message, true); }
+}
+function showWarnings(r) {
+  if (r && r.warnings && r.warnings.length) setTimeout(() => alert('Lưu ý:\n\n• ' + r.warnings.join('\n• ')), 300);
+}
 function costForm(existing) {
-  const c = existing || { date: today(), pay_method: 'tien_mat', category: '' };
+  const c = existing || { date: today(), pay_method: role() === 'chi_huy' ? 'tam_ung' : 'chuyen_khoan', category: '', evidence: 'hoa_don_gtgt' };
   const isChiHuy = role() === 'chi_huy';
   const body = openModal(existing ? `Sửa ${existing.code}` : 'Nhập chi phí', `<form id="costForm"><div class="form-error" hidden></div>
     <div class="form-grid">
       <div><label>Ngày chứng từ</label><input type="date" name="date" value="${esc(c.date)}" max="${today()}" required></div>
       <div><label>Công trình</label><select name="project_id">${projectOptions(c.project_id, { includeOverhead: !isChiHuy })}</select></div>
       <div><label>Loại chi phí</label><select name="category" id="catSel"></select></div>
-      <div><label>Nhà cung cấp / người nhận</label><select name="partner_id" id="partnerSel">${partnerOptions(c.partner_id, '— Không có / chọn —')}</select>
-        <a href="#" class="small" id="addPartner">+ Thêm nhà cung cấp mới</a></div>
+      <div><label>Loại chứng từ</label><select name="evidence" id="evSel">${options(C().EVIDENCE, c.evidence || 'hoa_don_gtgt')}</select></div>
+      <div class="full"><div class="notice small" id="evHint"></div></div>
+      <div><label id="partnerLbl">Nhà cung cấp / người nhận</label><select name="partner_id" id="partnerSel">${partnerOptions(c.partner_id, '— Không có / chọn —')}</select>
+        <a href="#" class="small" id="addPartner">+ Thêm mới</a></div>
+      <div><label>Số hoá đơn / số chứng từ</label><input name="invoice_no" value="${esc(c.invoice_no || '')}"></div>
       <div class="full"><label>Nội dung</label><input name="description" value="${esc(c.description || '')}" required placeholder="vd: Nhân công lắp đặt 3 ngày, 4 người"></div>
-      <div><label>Tiền trước thuế (đồng)</label><input name="amount_net" data-money inputmode="numeric" value="${c.amount_net ? fmt(c.amount_net) : ''}" required></div>
-      <div><label>Thuế GTGT</label><div class="actions"><select id="vatRate" class="no-grow"><option value="">Tự nhập</option><option value="0">0%</option><option value="5">5%</option><option value="8">8%</option><option value="10">10%</option></select>
+      <div><label id="netLbl">Tiền trước thuế (đồng)</label><input name="amount_net" data-money inputmode="numeric" value="${c.amount_net ? fmt(c.amount_net) : ''}" required></div>
+      <div id="vatBox"><label>Thuế GTGT</label><div class="actions"><select id="vatRate"><option value="">Tự nhập</option><option value="0">0%</option><option value="5">5%</option><option value="8">8%</option><option value="10">10%</option></select>
         <input name="vat" data-money inputmode="numeric" value="${c.vat ? fmt(c.vat) : '0'}"></div></div>
-      <div><label>Thanh toán</label><select name="pay_method">${options(C().PAY_METHODS, c.pay_method)}</select></div>
-      <div><label>Số hoá đơn (nếu có)</label><input name="invoice_no" value="${esc(c.invoice_no || '')}"></div>
-      ${existing ? '' : `<div class="full"><label>Ảnh/file chứng từ (bắt buộc): hoá đơn, phiếu chi, bảng công…</label><input type="file" id="costFiles" accept="image/*,application/pdf" multiple required>
-        <div class="field-hint">Có thể chụp trực tiếp bằng điện thoại. Ảnh tự nén cho nhẹ.</div></div>`}
+      <div id="pitBox" hidden><label>Thuế TNCN khấu trừ</label><input name="pit" data-money inputmode="numeric" value="${c.pit ? fmt(c.pit) : ''}">
+        <label class="check mt"><input type="checkbox" name="pit_exempt"> Người lao động có cam kết 08/CK-TNCN (không khấu trừ)</label></div>
+      <div><label>Thanh toán</label><select name="pay_method" id="paySel">${options(C().PAY_METHODS, c.pay_method)}</select></div>
+      ${isChiHuy ? '' : `<div id="advBox" hidden><label>Người đã chi bằng tiền tạm ứng</label><select name="advance_user_id">${S.boot.users.filter(u => u.active).map(u => `<option value="${u.id}" ${u.id === (c.advance_user_id || me().id) ? 'selected' : ''}>${esc(u.full_name)}</option>`).join('')}</select></div>`}
+      ${existing ? '' : `<div class="full"><label>Ảnh/file chứng từ (bắt buộc)</label><input type="file" id="costFiles" accept="image/*,application/pdf" multiple required>
+        <div class="field-hint">Có thể chụp trực tiếp bằng điện thoại, chọn nhiều ảnh. Ảnh tự nén cho nhẹ.</div></div>`}
       <div class="full"><div class="small muted" id="totalHint"></div></div>
     </div>
     <div class="form-actions"><button type="button" class="btn" data-close>Huỷ</button><button class="btn primary" type="submit">${existing ? 'Lưu' : 'Lưu chi phí'}</button></div></form>`);
   const f = $('#costForm', body);
-  const projSel = $('[name=project_id]', f), catSel = $('#catSel', f);
+  const projSel = $('[name=project_id]', f), catSel = $('#catSel', f), evSel = $('#evSel', f), paySel = $('#paySel', f);
   const fillCats = () => {
     const isProj = !!projSel.value;
     const map = isProj ? C().PROJECT_CATEGORIES : C().OVERHEAD_CATEGORIES;
@@ -346,38 +383,54 @@ function costForm(existing) {
   };
   fillCats();
   projSel.addEventListener('change', fillCats);
-  const net = $('[name=amount_net]', f), vat = $('[name=vat]', f), rate = $('#vatRate', f);
+  const net = $('[name=amount_net]', f), vat = $('[name=vat]', f), rate = $('#vatRate', f), pit = $('[name=pit]', f), pitEx = $('[name=pit_exempt]', f);
+  let pitTouched = !!c.pit;
   const recalc = () => {
-    if (rate.value !== '') vat.value = fmt(Math.round(parseMoney(net.value) * Number(rate.value) / 100));
-    $('#totalHint', f).textContent = `Tổng thanh toán: ${fmt(parseMoney(net.value) + parseMoney(vat.value))} đ`;
+    const ev = evSel.value;
+    if (ev !== 'hoa_don_gtgt') vat.value = '0';
+    else if (rate.value !== '') vat.value = fmt(Math.round(parseMoney(net.value) * Number(rate.value) / 100));
+    if (ev === 'nhan_cong_khoan' && !pitTouched) {
+      const n = parseMoney(net.value), st = S.boot.settings;
+      pit.value = !pitEx.checked && n >= Number(st.pit_threshold) ? fmt(Math.round(n * Number(st.pit_rate) / 100)) : '0';
+    }
+    const p = ev === 'nhan_cong_khoan' && !pitEx.checked ? parseMoney(pit.value) : 0;
+    const total = parseMoney(net.value) + parseMoney(vat.value);
+    $('#totalHint', f).textContent = `Tổng chi phí: ${fmt(total)} đ${p ? ` · Khấu trừ TNCN ${fmt(p)} đ · Thực trả người lao động: ${fmt(total - p)} đ` : ''}`;
   };
+  const onEvidence = () => {
+    const ev = evSel.value;
+    $('#evHint', f).textContent = EVIDENCE_HINT[ev] || '';
+    $('#vatBox', f).hidden = ev !== 'hoa_don_gtgt';
+    $('#pitBox', f).hidden = ev !== 'nhan_cong_khoan';
+    $('#partnerLbl', f).textContent = ['bang_ke', 'nhan_cong_khoan'].includes(ev) ? 'Người bán / người nhận tiền (cá nhân)' : 'Nhà cung cấp / người nhận';
+    $('#netLbl', f).textContent = ev === 'hoa_don_gtgt' ? 'Tiền trước thuế (đồng)' : ev === 'nhan_cong_khoan' ? 'Tiền công (trước khấu trừ TNCN)' : 'Số tiền (đồng)';
+    if (ev === 'nhan_cong_khoan' && catSel.querySelector('option[value=nhan_cong]')) catSel.value = 'nhan_cong';
+    recalc();
+  };
+  evSel.addEventListener('change', onEvidence);
+  const onPay = () => { const b = $('#advBox', f); if (b) b.hidden = paySel.value !== 'tam_ung'; };
+  paySel.addEventListener('change', onPay); onPay();
   net.addEventListener('input', recalc); rate.addEventListener('change', recalc); vat.addEventListener('input', () => { rate.value = ''; recalc(); });
-  recalc();
+  pit.addEventListener('input', () => { pitTouched = true; recalc(); }); pitEx.addEventListener('change', () => { pitTouched = false; recalc(); });
+  onEvidence();
   $('[data-close]', f).addEventListener('click', closeModal);
-  $('#addPartner', f).addEventListener('click', async (e) => {
-    e.preventDefault();
-    const name = prompt('Tên nhà cung cấp / người nhận:');
-    if (!name) return;
-    const mst = prompt('Mã số thuế (bỏ trống nếu không có):') || '';
-    try {
-      const r = await api('POST', '/api/partners', { kind: 'ncc', name, mst });
-      S.boot.partners.push({ id: r.id, kind: 'ncc', name, mst });
-      $('#partnerSel', f).innerHTML = partnerOptions(r.id, '— Không có / chọn —');
-    } catch (err) { toast(err.message, true); }
-  });
+  $('#addPartner', f).addEventListener('click', (e) => { e.preventDefault(); quickPartner($('#partnerSel', f), ['bang_ke', 'nhan_cong_khoan'].includes(evSel.value)); });
   f.addEventListener('submit', (e) => {
     e.preventDefault();
     submitting(f, async () => {
       const v = formValues(f);
+      if (v.evidence !== 'nhan_cong_khoan') { delete v.pit; delete v.pit_exempt; }
+      else if (v.pit_exempt) delete v.pit;
+      let r;
       if (existing) {
         await api('PUT', `/api/costs/${existing.id}`, v);
         toast('Đã lưu');
       } else {
         v.attachments = await readFiles($('#costFiles', f));
-        const r = await api('POST', '/api/costs', v);
+        r = await api('POST', '/api/costs', v);
         toast(r.status === 'cho_duyet' ? `Đã lưu ${r.code} — chờ duyệt` : `Đã ghi sổ ${r.code}`);
       }
-      closeModal(); await refreshPending(); route();
+      closeModal(); await refreshPending(); route(); showWarnings(r);
     });
   });
 }
@@ -441,7 +494,7 @@ function xmlForm() {
       v.attachments = await readFiles($('#xmlExtra', f));
       const r = await api('POST', '/api/costs/einvoice', v);
       toast(r.status === 'cho_duyet' ? `Đã lưu ${r.code} — chờ duyệt` : `Đã ghi sổ ${r.code}`);
-      closeModal(); await refreshPending(); route();
+      closeModal(); await refreshPending(); route(); showWarnings(r);
     });
   });
 }
@@ -451,7 +504,7 @@ function costsTable(items, { showProject = true } = {}) {
   const sumNet = items.filter(c => c.status === 'da_duyet').reduce((a, c) => a + c.amount_net, 0);
   const sumVat = items.filter(c => c.status === 'da_duyet').reduce((a, c) => a + c.vat, 0);
   return `<div class="table-wrap"><table><thead><tr><th>Mã</th><th>Ngày</th>${showProject ? '<th>Công trình</th>' : ''}<th>Loại</th><th>Nội dung</th><th>Nhà cung cấp</th><th class="num">Trước thuế</th><th class="num">Thuế</th><th>Trạng thái</th><th>File</th></tr></thead><tbody>
-    ${items.map(c => `<tr class="clickable" data-go="#/chi-phi/${c.id}"><td>${esc(c.code)}</td><td>${dmy(c.date)}</td>${showProject ? `<td>${esc(projCode(c.project_id))}</td>` : ''}<td>${esc(C().CATEGORIES[c.category] || c.category)}</td><td>${esc(c.description)}</td><td>${esc(partnerName(c.partner_id))}</td><td class="num">${money(c.amount_net)}</td><td class="num">${money(c.vat)}</td><td>${costPill(c)}</td><td>${c.files ? '📎' + c.files : '<span class="neg">—</span>'}</td></tr>`).join('')}
+    ${items.map(c => `<tr class="clickable" data-go="#/chi-phi/${c.id}"><td>${esc(c.code)}</td><td>${dmy(c.date)}</td>${showProject ? `<td>${esc(projCode(c.project_id))}</td>` : ''}<td>${esc(C().CATEGORIES[c.category] || c.category)}</td><td>${esc(c.description)}${c.evidence && c.evidence !== 'hoa_don_gtgt' ? `<div class="small muted">${esc((C().EVIDENCE[c.evidence] || '').split(' (')[0].split(' →')[0])}</div>` : ''}</td><td>${esc(partnerName(c.partner_id))}</td><td class="num">${money(c.amount_net)}</td><td class="num">${money(c.vat)}</td><td>${costPill(c)}</td><td>${c.files ? '📎' + c.files : '<span class="neg">—</span>'}</td></tr>`).join('')}
     </tbody><tfoot><tr><td colspan="${showProject ? 6 : 5}">Cộng đã ghi sổ</td><td class="num">${fmt(sumNet)}</td><td class="num">${fmt(sumVat)}</td><td colspan="2"></td></tr></tfoot></table></div>`;
 }
 
@@ -477,9 +530,9 @@ async function pageCosts(main) {
   };
   ['#fMonth', '#fProject', '#fStatus'].forEach(s => $(s).addEventListener('change', load));
   $('#btnCsv').addEventListener('click', () => csvDownload(`chi-phi-${$('#fMonth').value || 'tat-ca'}.csv`, [
-    ['Mã', 'Ngày', 'Công trình', 'Loại', 'Nội dung', 'Nhà cung cấp', 'MST NCC', 'Trước thuế', 'Thuế GTGT', 'Tổng', 'Thanh toán', 'Số HĐ', 'Trạng thái', 'Người lập', 'Người duyệt'],
+    ['Mã', 'Ngày', 'Công trình', 'Loại', 'Nội dung', 'Nhà cung cấp', 'MST NCC', 'Trước thuế', 'Thuế GTGT', 'Tổng', 'Thanh toán', 'Số HĐ', 'Trạng thái', 'Người lập', 'Người duyệt', 'Loại chứng từ', 'TNCN khấu trừ'],
     ...items.map(c => [c.code, c.date, projCode(c.project_id), C().CATEGORIES[c.category], c.description, partnerName(c.partner_id), S.boot.partners.find(p => p.id === c.partner_id)?.mst || '',
-      c.amount_net, c.vat, c.amount_net + c.vat, C().PAY_METHODS[c.pay_method], c.invoice_no, c.reverses_id ? 'Bút toán đảo' : c.reversed_by_id ? 'Đã huỷ' : C().COST_STATUS[c.status], userName(c.created_by), userName(c.approved_by)]),
+      c.amount_net, c.vat, c.amount_net + c.vat, C().PAY_METHODS[c.pay_method], c.invoice_no, c.reverses_id ? 'Bút toán đảo' : c.reversed_by_id ? 'Đã huỷ' : C().COST_STATUS[c.status], userName(c.created_by), userName(c.approved_by), C().EVIDENCE[c.evidence] || '', c.pit || 0]),
   ]));
   await load();
 }
@@ -503,7 +556,11 @@ async function pageCostDetail(main, id) {
       <div>Nhà cung cấp</div><div>${esc(partnerName(c.partner_id)) || '—'}</div>
       <div>Tiền trước thuế</div><div>${money(c.amount_net)} đ</div>
       <div>Thuế GTGT</div><div>${money(c.vat)} đ</div>
-      <div>Tổng thanh toán</div><div><b>${money(c.amount_net + c.vat)} đ</b> — ${esc(C().PAY_METHODS[c.pay_method])}</div>
+      <div>Loại chứng từ</div><div>${esc(C().EVIDENCE[c.evidence] || '')}</div>
+      ${c.pit ? `<div>Khấu trừ thuế TNCN</div><div>${money(c.pit)} đ (thực trả ${fmt(c.amount_net + c.vat - c.pit)} đ)</div>` : ''}
+      <div>Tổng chi phí</div><div><b>${money(c.amount_net + c.vat)} đ</b> — ${esc(C().PAY_METHODS[c.pay_method])}${c.pay_method === 'tam_ung' ? ' của ' + esc(userName(c.advance_user_id)) : ''}</div>
+      ${c.evidence === 'khong_hop_le' ? '<div>Thuế</div><div><span class="pill bad">Không được trừ khi tính thuế TNDN</span></div>' : ''}
+      ${c.vat && c.pay_method === 'tien_mat' && (c.amount_net + c.vat) >= Number(S.boot.settings.cash_limit) ? '<div>Thuế</div><div><span class="pill bad">Trả tiền mặt ≥ ngưỡng: thuế GTGT đầu vào không được khấu trừ</span></div>' : ''}
       <div>Số hoá đơn</div><div>${esc(c.invoice_no) || '—'} ${c.invoice_date ? '· ' + dmy(c.invoice_date) : ''} ${c.source === 'hddt' ? '<span class="pill ok">Từ hoá đơn điện tử</span>' : ''}</div>
       <div>Người lập</div><div>${esc(userName(c.created_by))} · ${esc(c.created_at)}</div>
       <div>Người duyệt</div><div>${c.approved_by ? `${esc(userName(c.approved_by))} · ${esc(c.approved_at)}` : '—'}</div>
@@ -573,7 +630,7 @@ async function pageProjects(main) {
   main.innerHTML = `<div class="page-head"><div><h1>Công trình</h1><p class="muted">Lũy kế từ đầu đến nay, chỉ tính số đã ghi sổ.</p></div>
     <div class="actions">${can('quan_tri', 'ke_toan') ? '<button class="btn primary" id="btnAddPj">+ Thêm công trình</button>' : ''}<button class="btn" id="btnCsv">Xuất Excel (CSV)</button></div></div>
     <div class="card"><div class="table-wrap"><table><thead><tr><th>Mã</th><th>Tên</th><th>Trạng thái</th><th class="num">Giá trị HĐ</th><th class="num">Doanh thu</th><th class="num">Chi phí</th><th class="num">Lãi gộp</th><th class="num">% lãi</th><th class="num">Còn phải thu</th></tr></thead><tbody>
-    ${items.map(p => `<tr class="clickable" data-go="#/cong-trinh/${p.id}"><td>${esc(p.code)}</td><td>${esc(p.name)}</td><td>${projectPill(p.status)}</td><td class="num">${fmt(p.contract_value)}</td><td class="num">${fmt(p.revenue)}</td><td class="num">${fmt(p.cost)}</td><td class="num">${money(p.gross)}</td><td class="num">${p.revenue ? pctTxt(p.gross_pct) : '—'}</td><td class="num">${fmt(p.receivable)}</td></tr>`).join('') || '<tr><td colspan="9" class="muted">Chưa có công trình.</td></tr>'}
+    ${items.map(p => `<tr class="clickable" data-go="#/cong-trinh/${p.id}"><td>${esc(p.code)}</td><td>${esc(p.name)}${p.over_budget.length ? ' <span class="pill bad">Vượt dự toán</span>' : ''}</td><td>${projectPill(p.status)}</td><td class="num">${fmt(p.contract_value)}</td><td class="num">${fmt(p.revenue)}</td><td class="num">${fmt(p.cost)}${p.budget_total ? `<div class="small muted">${pctTxt(p.budget_used_pct)} dự toán</div>` : ''}</td><td class="num">${money(p.gross)}</td><td class="num">${p.revenue ? pctTxt(p.gross_pct) : '—'}</td><td class="num">${fmt(p.receivable)}</td></tr>`).join('') || '<tr><td colspan="9" class="muted">Chưa có công trình.</td></tr>'}
     </tbody><tfoot><tr><td colspan="3">Cộng (trừ công trình huỷ)</td><td class="num">${fmt(sum('contract_value'))}</td><td class="num">${fmt(sum('revenue'))}</td><td class="num">${fmt(sum('cost'))}</td><td class="num">${fmt(sum('gross'))}</td><td></td><td class="num">${fmt(sum('receivable'))}</td></tr></tfoot></table></div></div>`;
   bindCommon(main);
   $('#btnAddPj')?.addEventListener('click', () => projectForm());
@@ -602,15 +659,19 @@ async function pageProjectDetail(main, id) {
       <div class="kpi"><div class="l">Lãi gộp</div><div class="v ${s.gross < 0 ? 'neg' : ''}">${fmt(s.gross)}</div><div class="l">${s.revenue ? pctTxt(s.gross_pct) + ' doanh thu' : ''}</div></div>
       <div class="kpi"><div class="l">Còn phải thu khách</div><div class="v">${fmt(s.receivable)}</div></div>
     </div>
-    <div class="card"><h2>Bóc tách chi phí</h2><div class="table-wrap"><table><tbody>
-      ${Object.entries(C().PROJECT_CATEGORIES).map(([k, l]) => `<tr><td>${esc(l)}</td><td class="num">${fmt(s.costs[k] || 0)}</td><td class="num muted">${s.cost ? pctTxt(Math.round((s.costs[k] || 0) * 10000 / s.cost) / 100) : ''}</td></tr>`).join('')}
-    </tbody><tfoot><tr><td>Tổng chi phí</td><td class="num">${fmt(s.cost)}</td><td></td></tr></tfoot></table></div></div>
+    <div class="card"><div class="page-head"><h2>Bóc tách chi phí & dự toán</h2>${can('quan_tri', 'ke_toan') ? '<button class="btn sm" id="pBudget">Lập / sửa dự toán</button>' : ''}</div>
+      ${s.over_budget.length ? `<div class="notice bad">Vượt dự toán: ${s.over_budget.map(k => esc(C().PROJECT_CATEGORIES[k])).join(', ')}</div>` : ''}
+      <div class="table-wrap"><table><thead><tr><th>Khoản mục</th><th class="num">Thực tế</th><th class="num">% tổng CP</th><th class="num">Dự toán</th><th class="num">% dùng</th><th class="num">Còn lại</th></tr></thead><tbody>
+      ${Object.entries(C().PROJECT_CATEGORIES).map(([k, l]) => { const a = s.costs[k] || 0, b = s.budget[k] || 0; return `<tr><td>${esc(l)}</td><td class="num">${fmt(a)}</td><td class="num muted">${s.cost ? pctTxt(Math.round(a * 10000 / s.cost) / 100) : ''}</td><td class="num">${b ? fmt(b) : '—'}</td><td class="num ${b && a > b ? 'neg' : ''}">${b ? pctTxt(Math.round(a * 10000 / b) / 100) : ''}</td><td class="num">${b ? money(b - a) : ''}</td></tr>`; }).join('')}
+    </tbody><tfoot><tr><td>Tổng</td><td class="num">${fmt(s.cost)}</td><td></td><td class="num">${s.budget_total ? fmt(s.budget_total) : '—'}</td><td class="num">${s.budget_total ? pctTxt(s.budget_used_pct) : ''}</td><td class="num">${s.budget_total ? money(s.budget_total - s.cost) : ''}</td></tr></tfoot></table></div>
+      ${s.planned_gross != null ? `<p class="small muted">Lãi gộp dự kiến theo dự toán: <b>${fmt(s.planned_gross)}</b> đ${s.contract_value ? ` (${pctTxt(Math.round(s.planned_gross * 10000 / s.contract_value) / 100)} giá trị HĐ)` : ''}.</p>` : ''}</div>
     <div class="card"><h2>Chi phí</h2>${costsTable(costs.items, { showProject: false })}</div>
     <div class="card"><h2>Doanh thu (hoá đơn xuất cho khách)</h2>${ledgerTable('revenues', revs.items)}</div>
     <div class="card"><h2>Tiền khách đã trả</h2>${ledgerTable('receipts', recs.items)}</div>`;
   bindCommon(main);
   bindLedger(main);
   $('#pEdit')?.addEventListener('click', () => projectForm(p));
+  $('#pBudget')?.addEventListener('click', () => budgetForm(p, s));
   $('#pAccept')?.addEventListener('click', () => {
     const body = openModal('Nghiệm thu công trình', `<form id="accForm"><div class="form-error" hidden></div>
       <p>Khi nghiệm thu, toàn bộ chi phí dở dang (TK 154) của công trình được kết chuyển sang giá vốn (TK 632) và lãi/lỗ công trình được tính vào tháng nghiệm thu.</p>
@@ -767,6 +828,7 @@ async function pageReport(main) {
         <div class="kpi"><div class="l">Điều chỉnh sau nghiệm thu</div><div class="v">${fmt(r.adjustments)}</div></div>
         <div class="kpi"><div class="l">Chi phí chung</div><div class="v">${fmt(r.overhead_total)}</div></div>
         <div class="kpi"><div class="l">Dự phòng bảo hành (${pctTxt(r.warranty_pct)})</div><div class="v">${fmt(r.warranty)}</div></div>
+        ${r.overhead_manual || r.other_income || r.other_expense || r.cit ? `<div class="kpi"><div class="l">Từ bút toán khác: QLDN / thu khác / chi khác / thuế TNDN</div><div class="v small">${fmt(r.overhead_manual)} / ${fmt(r.other_income)} / ${fmt(r.other_expense)} / ${fmt(r.cit)}</div></div>` : ''}
         <div class="kpi"><div class="l"><b>Lãi ròng tháng</b></div><div class="v ${r.net < 0 ? 'neg' : 'pos'}">${fmt(r.net)}</div></div>
       </div>
       <div class="card"><h2>Chia theo cổ phần</h2><div class="table-wrap"><table><thead><tr><th>Cổ đông</th><th class="num">Tỷ lệ</th><th class="num">Phần lãi/lỗ tháng</th></tr></thead><tbody>
@@ -776,7 +838,10 @@ async function pageReport(main) {
       <div class="card"><h2>Chi phí chung (TK 6422)</h2><div class="table-wrap"><table><tbody>${ohRows}</tbody><tfoot><tr><td>Cộng</td><td class="num">${fmt(r.overhead_total)}</td></tr></tfoot></table></div></div>
       <div class="card"><h2>Tổng hợp phát sinh tháng</h2><div class="kv">
         <div>Doanh thu (trước thuế)</div><div>${fmt(r.totals.revenue)}</div><div>Thuế GTGT đầu ra</div><div>${fmt(r.totals.vat_out)}</div>
-        <div>Chi phí (trước thuế)</div><div>${fmt(r.totals.cost)}</div><div>Thuế GTGT đầu vào</div><div>${fmt(r.totals.vat_in)}</div>
+        <div>Chi phí (trước thuế)</div><div>${fmt(r.totals.cost)}</div><div>Thuế GTGT đầu vào</div><div>${fmt(r.totals.vat_in)}${r.totals.vat_in_blocked ? ` (không được khấu trừ: ${fmt(r.totals.vat_in_blocked)})` : ''}</div>
+        <div>Thuế GTGT phải nộp (tạm tính)</div><div>${fmt(r.totals.vat_payable ?? 0)}</div>
+        <div>Thuế TNCN đã khấu trừ</div><div>${fmt(r.totals.pit_withheld ?? 0)}</div>
+        <div>Chi phí không được trừ (thuế TNDN)</div><div>${fmt(r.totals.non_deductible ?? 0)}</div>
         <div>Thu tiền khách</div><div>${fmt(r.totals.receipts)}</div><div>Trả nhà cung cấp</div><div>${fmt(r.totals.payments)}</div>
         <div>Chi phí dở dang cuối tháng (TK 154)</div><div>${fmt(r.wip)}</div></div></div>
       <div class="card"><h2>Ký xác nhận</h2>${d.signoffs.length ? `<ul class="sign-list">${d.signoffs.map(x => `<li><b>${esc(x.full_name)}</b> đã ký lúc ${esc(x.signed_at)}${x.note ? ' — ' + esc(x.note) : ''}</li>`).join('')}</ul>` : '<p class="muted">Chưa ai ký.</p>'}</div>`;
@@ -852,8 +917,8 @@ async function pageAudit(main) {
 async function pagePartners(main) {
   main.innerHTML = `<div class="page-head"><div><h1>Nhà cung cấp & khách hàng</h1><p class="muted">INSOLAR được nhận diện theo MST ${esc(S.boot.settings.insolar_mst)} (đổi trong Cài đặt). Nhà cung cấp mới tự tạo khi nhập hoá đơn XML.</p></div>
     <div class="actions"><button class="btn primary" id="addP">+ Thêm</button></div></div>
-    <div class="card"><div class="table-wrap"><table><thead><tr><th>Tên</th><th>Loại</th><th>MST</th><th>Địa chỉ</th><th>Điện thoại</th><th></th></tr></thead><tbody>
-    ${S.boot.partners.map(p => `<tr><td>${esc(p.name)} ${p.mst && p.mst === S.boot.settings.insolar_mst ? '<span class="pill ok">INSOLAR</span>' : ''}</td><td>${esc(C().PARTNER_KIND[p.kind])}</td><td>${esc(p.mst)}</td><td>${esc(p.address)}</td><td>${esc(p.phone)}</td><td><button class="btn sm" data-edit="${p.id}">Sửa</button></td></tr>`).join('') || '<tr><td colspan="6" class="muted">Chưa có.</td></tr>'}
+    <div class="card"><div class="table-wrap"><table><thead><tr><th>Tên</th><th>Loại</th><th>MST / CCCD</th><th>Địa chỉ</th><th>Điện thoại</th><th></th></tr></thead><tbody>
+    ${S.boot.partners.map(p => `<tr><td>${esc(p.name)} ${p.mst && p.mst === S.boot.settings.insolar_mst ? '<span class="pill ok">INSOLAR</span>' : ''}</td><td>${esc(C().PARTNER_KIND[p.kind])}</td><td>${esc(p.mst || (p.id_no ? 'CCCD ' + p.id_no : ''))}</td><td>${esc(p.address)}</td><td>${esc(p.phone)}</td><td><button class="btn sm" data-edit="${p.id}">Sửa</button></td></tr>`).join('') || '<tr><td colspan="6" class="muted">Chưa có.</td></tr>'}
     </tbody></table></div></div>`;
   const form = (p) => {
     const x = p || { kind: 'ncc' };
@@ -863,6 +928,7 @@ async function pagePartners(main) {
       <div><label>Mã số thuế</label><input name="mst" value="${esc(x.mst || '')}" inputmode="numeric"></div>
       <div class="full"><label>Địa chỉ</label><input name="address" value="${esc(x.address || '')}"></div>
       <div><label>Điện thoại</label><input name="phone" value="${esc(x.phone || '')}"></div>
+      <div><label>Số CCCD (cá nhân bán hàng/nhận khoán)</label><input name="id_no" value="${esc(x.id_no || '')}" inputmode="numeric"></div>
     </div><div class="form-actions"><button type="button" class="btn" data-close>Huỷ</button><button class="btn primary" type="submit">Lưu</button></div></form>`);
     const f = $('#ptForm', body);
     $('[data-close]', f).addEventListener('click', closeModal);
@@ -887,6 +953,8 @@ async function pageSettings(main) {
       <div><label>Tên INSOLAR</label><input name="insolar_name" value="${esc(s.insolar_name)}"></div>
       <div><label>Ngưỡng phải duyệt (tổng tiền gồm thuế, đồng)</label><input name="approval_threshold" data-money value="${fmt(s.approval_threshold)}"><div class="field-hint">Khoản lớn hơn ngưỡng phải có người khác duyệt. Khoản do chỉ huy nhập luôn phải duyệt.</div></div>
       <div><label>Dự phòng bảo hành (% doanh thu công trình nghiệm thu)</label><input name="warranty_pct" inputmode="decimal" value="${esc(s.warranty_pct)}"></div>
+      <div><label>Ngưỡng bắt buộc chuyển khoản (đồng)</label><input name="cash_limit" data-money value="${fmt(s.cash_limit)}"><div class="field-hint">Hoá đơn từ mức này trả tiền mặt thì thuế GTGT đầu vào không được khấu trừ (Luật Thuế GTGT 2024: 5 triệu).</div></div>
+      <div><label>Khấu trừ TNCN thuê khoán: tỷ lệ % / từ mức (đồng)</label><div class="actions"><input name="pit_rate" inputmode="decimal" value="${esc(s.pit_rate)}"><input name="pit_threshold" data-money value="${fmt(s.pit_threshold)}"></div><div class="field-hint">Mặc định 10% cho mỗi lần trả từ 2.000.000đ (TT 111/2013).</div></div>
     </div><div class="form-actions"><button class="btn primary" type="submit">Lưu cài đặt</button></div></form></div>
     <div class="card"><h2>Cổ đông</h2><form id="shForm"><div class="form-error" hidden></div><div id="shRows"></div>
       <button type="button" class="btn sm" id="addSh">+ Thêm cổ đông</button>
@@ -953,6 +1021,188 @@ async function pageAccount(main) {
     if (v.new_password !== v.new_password2) throw new Error('Hai lần nhập mật khẩu mới không giống nhau');
     await api('POST', '/api/me/password', v); f.reset(); toast('Đã đổi mật khẩu');
   }); });
+}
+
+// ---------- Tạm ứng (TK 141) ----------
+async function pageAdvances(main) {
+  const d = await api('GET', '/api/advances');
+  const kindPill = (a) => (a.reverses_id ? '<span class="pill gray">Bút toán đảo</span>' : a.reversed_by_id ? '<span class="pill gray">Đã huỷ</span>' : `<span class="pill ${a.kind === 'cap' ? 'warn' : 'ok'}">${esc(C().ADVANCE_KIND[a.kind])}</span>`);
+  main.innerHTML = `<div class="page-head"><div><h1>Tạm ứng</h1><p class="muted">Kế toán cấp tiền tạm ứng (Nợ 141). Người được tạm ứng nhập chi phí với hình thức "Tiền tạm ứng" (Có 141). Tiền thừa nộp lại bằng "Hoàn ứng".</p></div>
+    <div class="actions">${can('quan_tri', 'ke_toan') ? '<button class="btn primary" id="addAdv">+ Cấp tạm ứng / hoàn ứng</button>' : ''}${can('chi_huy') ? '<button class="btn primary" id="btnAddCost">+ Nhập chi phí bằng tiền tạm ứng</button>' : ''}</div></div>
+    <div class="card"><h2>Số dư tạm ứng</h2><div class="table-wrap"><table><thead><tr><th>Người</th><th class="num">Đã cấp</th><th class="num">Đã chi (đã duyệt)</th><th class="num">Đã hoàn</th><th class="num">Còn giữ</th><th class="num">Chi đang chờ duyệt</th></tr></thead><tbody>
+      ${d.balances.map(b => `<tr><td>${esc(b.full_name)}</td><td class="num">${fmt(b.given)}</td><td class="num">${fmt(b.spent)}</td><td class="num">${fmt(b.returned)}</td><td class="num"><b>${money(b.balance)}</b></td><td class="num">${fmt(b.pending)}</td></tr>`).join('') || '<tr><td colspan="6" class="muted">Chưa có tạm ứng.</td></tr>'}
+    </tbody></table></div></div>
+    <div class="card"><h2>Phiếu tạm ứng / hoàn ứng</h2><div class="table-wrap"><table><thead><tr><th>Mã</th><th>Ngày</th><th>Người</th><th>Loại</th><th>Hình thức</th><th>Nội dung</th><th class="num">Số tiền</th><th></th></tr></thead><tbody>
+      ${d.items.map(a => `<tr><td>${esc(a.code)}</td><td>${dmy(a.date)}</td><td>${esc(userName(a.user_id))}</td><td>${kindPill(a)}</td><td>${esc(C().CASH_METHODS[a.method])}</td><td>${esc(a.description)}</td><td class="num">${money(a.amount)}</td>
+        <td>${can('quan_tri', 'ke_toan') && !a.reverses_id && !a.reversed_by_id ? `<button class="btn sm danger" data-void="advances:${a.id}">Huỷ</button>` : ''}</td></tr>`).join('') || '<tr><td colspan="8" class="muted">Chưa có.</td></tr>'}
+    </tbody></table></div></div>`;
+  bindCommon(main); bindLedger(main);
+  $('#addAdv')?.addEventListener('click', () => {
+    const body = openModal('Cấp tạm ứng / hoàn ứng', `<form id="advForm"><div class="form-error" hidden></div><div class="form-grid">
+      <div><label>Loại</label><select name="kind">${options(C().ADVANCE_KIND, 'cap')}</select></div>
+      <div><label>Ngày</label><input type="date" name="date" value="${today()}" max="${today()}" required></div>
+      <div><label>Người nhận / người hoàn</label><select name="user_id" required>${S.boot.users.filter(u => u.active).map(u => `<option value="${u.id}">${esc(u.full_name)} (${esc(C().ROLES[u.role])})</option>`).join('')}</select></div>
+      <div><label>Số tiền</label><input name="amount" data-money inputmode="numeric" required></div>
+      <div><label>Hình thức</label><select name="method">${options(C().CASH_METHODS, 'chuyen_khoan')}</select></div>
+      <div class="full"><label>Nội dung</label><input name="description" placeholder="vd: Tạm ứng mua vật tư công trình CT-2610-01"></div>
+      <div class="full"><label>Chứng từ (phiếu chi / uỷ nhiệm chi, không bắt buộc)</label><input type="file" id="advFiles" accept="image/*,application/pdf" multiple></div>
+    </div><div class="form-actions"><button type="button" class="btn" data-close>Huỷ</button><button class="btn primary" type="submit">Lưu</button></div></form>`);
+    const f = $('#advForm', body);
+    $('[data-close]', f).addEventListener('click', closeModal);
+    f.addEventListener('submit', (e) => { e.preventDefault(); submitting(f, async () => {
+      const v = formValues(f); v.attachments = await readFiles($('#advFiles', f));
+      const r = await api('POST', '/api/advances', v); toast(`Đã ghi ${r.code}`); closeModal(); route();
+    }); });
+  });
+}
+
+// ---------- Thuế & bảng kê ----------
+async function pageTax(main) {
+  const m = sessionStorage.getItem('taxMonth') || prevMonth(thisMonth());
+  main.innerHTML = `<div class="page-head"><div><h1>Thuế & bảng kê</h1><p class="muted">Tự tổng hợp từ chứng từ đã ghi sổ: thuế GTGT, Bảng kê hàng hoá/dịch vụ mua không có hoá đơn (mẫu 01/TNDN), thuế TNCN đã khấu trừ, chi phí không được trừ.</p></div></div>
+    <div class="filters">${monthInput('fMonth', m)}</div><div id="taxBox" class="loading">Đang tải…</div>`;
+  const rowsTable = (rows, cols) => rows.length ? `<div class="table-wrap"><table><thead><tr>${cols.map(c => `<th class="${c[2] || ''}">${esc(c[0])}</th>`).join('')}</tr></thead><tbody>
+    ${rows.map(r => `<tr>${cols.map(c => `<td class="${c[2] || ''}">${c[2] === 'num' ? money(r[c[1]]) : esc(c[1] === 'date' ? dmy(r.date) : r[c[1]])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>` : '<p class="muted">Không có.</p>';
+  const load = async () => {
+    const mm = $('#fMonth').value || prevMonth(thisMonth()); sessionStorage.setItem('taxMonth', mm);
+    const t = await api('GET', `/api/report/tax?m=${mm}`);
+    $('#taxBox').className = '';
+    $('#taxBox').innerHTML = `
+      <div class="kpis">
+        <div class="kpi"><div class="l">GTGT đầu ra</div><div class="v">${fmt(t.vat.out)}</div></div>
+        <div class="kpi"><div class="l">GTGT đầu vào được khấu trừ</div><div class="v">${fmt(t.vat.in_deductible)}</div><div class="l">${t.vat.in_blocked ? 'Không được khấu trừ: ' + fmt(t.vat.in_blocked) : ''}</div></div>
+        <div class="kpi"><div class="l">GTGT phải nộp (tạm tính)</div><div class="v ${t.vat.payable < 0 ? 'pos' : ''}">${fmt(t.vat.payable)}</div><div class="l">${t.vat.payable < 0 ? 'Âm = còn được khấu trừ chuyển kỳ sau' : ''}</div></div>
+        <div class="kpi"><div class="l">Chi phí không có hoá đơn</div><div class="v">${fmt(t.no_invoice_total)}</div></div>
+      </div>
+      <div class="card"><div class="page-head"><h2>Bảng kê 01/TNDN — mua hàng hoá, dịch vụ không có hoá đơn</h2><button class="btn sm" id="csvBk">Xuất Excel</button></div>
+        <p class="small muted">Người bán là cá nhân/hộ không phải xuất hoá đơn (nông sản, cát đá, vật liệu nhỏ lẻ, thuê dịch vụ…). Kế toán in, ký và lưu cùng chứng từ để được tính vào chi phí được trừ.</p>
+        ${rowsTable(t.bang_ke, [['Ngày', 'date'], ['Chứng từ', 'code'], ['Người bán', 'partner'], ['Địa chỉ', 'address'], ['Số CCCD', 'id_no'], ['Hàng hoá, dịch vụ', 'description'], ['Công trình', 'project'], ['Thành tiền', 'amount_net', 'num']])}</div>
+      <div class="card"><div class="page-head"><h2>Thuế TNCN đã khấu trừ (thuê khoán cá nhân)</h2><button class="btn sm" id="csvPit">Xuất Excel</button></div>
+        <p class="small muted">Nộp số đã khấu trừ theo tờ khai 05/KK-TNCN. Người có cam kết 08/CK-TNCN không bị khấu trừ, vẫn có tên ở đây để quyết toán.</p>
+        ${rowsTable(t.pit, [['Ngày', 'date'], ['Chứng từ', 'code'], ['Người nhận', 'partner'], ['Số CCCD', 'id_no'], ['Nội dung', 'description'], ['Tiền công', 'amount_net', 'num'], ['TNCN khấu trừ', 'pit', 'num']])}</div>
+      <div class="card"><h2>Thuế GTGT đầu vào KHÔNG được khấu trừ</h2><p class="small muted">Hoá đơn từ ${fmt(t.cash_limit)}đ trả bằng tiền mặt, hoặc chứng từ không phải hoá đơn GTGT có ghi thuế.</p>
+        ${rowsTable(t.vat_blocked, [['Ngày', 'date'], ['Chứng từ', 'code'], ['Nhà cung cấp', 'partner'], ['Nội dung', 'description'], ['Trước thuế', 'amount_net', 'num'], ['Thuế GTGT', 'vat', 'num']])}</div>
+      <div class="card"><h2>Chi phí không được trừ khi tính thuế TNDN</h2>
+        ${rowsTable(t.non_deductible, [['Ngày', 'date'], ['Chứng từ', 'code'], ['Công trình', 'project'], ['Nội dung', 'description'], ['Số tiền', 'amount_net', 'num']])}</div>`;
+    $('#csvBk').addEventListener('click', () => csvDownload(`bang-ke-01-TNDN-${mm}.csv`, [
+      [`BẢNG KÊ THU MUA HÀNG HOÁ, DỊCH VỤ MUA VÀO KHÔNG CÓ HOÁ ĐƠN — tháng ${my(mm)}`], [`Doanh nghiệp: ${S.boot.settings.company_name} — MST: ${S.boot.settings.company_mst}`], [],
+      ['STT', 'Ngày mua', 'Tên người bán', 'Địa chỉ', 'Số CCCD', 'Tên hàng hoá, dịch vụ', 'Thành tiền', 'Chứng từ', 'Công trình'],
+      ...t.bang_ke.map((r, i) => [i + 1, r.date, r.partner, r.address, r.id_no, r.description, r.amount_net, r.code, r.project]),
+      ['', '', '', '', '', 'Tổng cộng', t.bang_ke.reduce((a, r) => a + r.amount_net, 0)],
+    ]));
+    $('#csvPit').addEventListener('click', () => csvDownload(`khau-tru-TNCN-${mm}.csv`, [
+      ['STT', 'Ngày', 'Họ tên', 'Số CCCD', 'Nội dung', 'Thu nhập', 'Thuế TNCN đã khấu trừ', 'Chứng từ'],
+      ...t.pit.map((r, i) => [i + 1, r.date, r.partner, r.id_no, r.description, r.amount_net, r.pit, r.code]),
+    ]));
+  };
+  $('#fMonth').addEventListener('change', load);
+  await load();
+}
+
+// ---------- Bảng cân đối số phát sinh, sổ cái, sổ quỹ ----------
+async function pageTrial(main) {
+  const m = sessionStorage.getItem('tbMonth') || thisMonth();
+  const acc = sessionStorage.getItem('tbAcc') || '111';
+  main.innerHTML = `<div class="page-head"><div><h1>Cân đối số phát sinh & sổ cái</h1><p class="muted">Bấm vào một tài khoản để xem sổ cái. TK 111 là sổ quỹ tiền mặt, TK 112 là sổ tiền gửi ngân hàng.</p></div>
+    <div class="actions"><button class="btn" id="csvTb">Xuất Excel</button></div></div>
+    <div class="filters">${monthInput('fMonth', m)}</div><div id="tbBox" class="loading">Đang tải…</div><div id="ledBox"></div>`;
+  let tb;
+  const loadLedger = async (a) => {
+    sessionStorage.setItem('tbAcc', a);
+    const mm = $('#fMonth').value || thisMonth();
+    const l = await api('GET', `/api/report/ledger?acc=${encodeURIComponent(a)}&m=${mm}`);
+    $('#ledBox').innerHTML = `<div class="card"><div class="page-head"><h2>Sổ cái TK ${esc(l.acc)} — ${esc(l.name)} — tháng ${my(mm)}</h2><button class="btn sm" id="csvLed">Xuất Excel</button></div>
+      <div class="table-wrap"><table><thead><tr><th>Ngày</th><th>Chứng từ</th><th>Diễn giải</th><th>Đối tượng</th><th>TK đối ứng</th><th class="num">Nợ</th><th class="num">Có</th><th class="num">Số dư</th></tr></thead><tbody>
+      <tr class="sub"><td colspan="7">Số dư đầu kỳ</td><td class="num">${money(l.opening)}</td></tr>
+      ${l.rows.map(r => `<tr><td>${dmy(r.date)}</td><td>${esc(r.code)}</td><td>${esc(r.desc)}</td><td>${esc(r.obj)}</td><td>${esc(r.contra)}</td><td class="num">${r.debit ? money(r.debit) : ''}</td><td class="num">${r.credit ? money(r.credit) : ''}</td><td class="num">${money(r.balance)}</td></tr>`).join('')}
+      </tbody><tfoot><tr><td colspan="5">Cộng phát sinh / số dư cuối kỳ</td><td class="num">${fmt(l.debit)}</td><td class="num">${fmt(l.credit)}</td><td class="num">${fmt(l.closing)}</td></tr></tfoot></table></div>
+      <p class="small muted">Số dư dương là dư Nợ, âm là dư Có.${['111', '112'].includes(l.acc) && l.closing < 0 ? ' <b class="neg">Quỹ âm: thiếu số dư đầu kỳ hoặc thiếu chứng từ thu.</b>' : ''}</p></div>`;
+    $('#csvLed').addEventListener('click', () => csvDownload(`so-cai-${l.acc}-${mm}.csv`, [
+      ['Ngày', 'Chứng từ', 'Diễn giải', 'Đối tượng', 'TK đối ứng', 'Nợ', 'Có', 'Số dư'], ['', '', 'Số dư đầu kỳ', '', '', '', '', l.opening],
+      ...l.rows.map(r => [r.date, r.code, r.desc, r.obj, r.contra, r.debit, r.credit, r.balance]), ['', '', 'Cuối kỳ', '', '', l.debit, l.credit, l.closing],
+    ]));
+  };
+  const load = async () => {
+    const mm = $('#fMonth').value || thisMonth(); sessionStorage.setItem('tbMonth', mm);
+    tb = await api('GET', `/api/report/trial?m=${mm}`);
+    const t = tb.totals;
+    $('#tbBox').className = '';
+    $('#tbBox').innerHTML = `<div class="card"><h2>Bảng cân đối số phát sinh tháng ${my(mm)}</h2><div class="table-wrap"><table><thead><tr><th>TK</th><th>Tên tài khoản</th><th class="num">Dư Nợ đầu</th><th class="num">Dư Có đầu</th><th class="num">PS Nợ</th><th class="num">PS Có</th><th class="num">Dư Nợ cuối</th><th class="num">Dư Có cuối</th></tr></thead><tbody>
+      ${tb.rows.map(r => `<tr class="clickable" data-acc="${esc(r.acc)}"><td><a href="#" data-acc="${esc(r.acc)}">${esc(r.acc)}</a></td><td>${esc(r.name)}</td><td class="num">${fmt(r.open_debit)}</td><td class="num">${fmt(r.open_credit)}</td><td class="num">${fmt(r.debit)}</td><td class="num">${fmt(r.credit)}</td><td class="num">${fmt(r.close_debit)}</td><td class="num">${fmt(r.close_credit)}</td></tr>`).join('') || '<tr><td colspan="8" class="muted">Chưa có số liệu.</td></tr>'}
+      </tbody><tfoot><tr><td colspan="2">Cộng ${t.debit === t.credit && t.close_debit === t.close_credit ? '<span class="pill ok">Cân</span>' : '<span class="pill bad">Lệch</span>'}</td><td class="num">${fmt(t.open_debit)}</td><td class="num">${fmt(t.open_credit)}</td><td class="num">${fmt(t.debit)}</td><td class="num">${fmt(t.credit)}</td><td class="num">${fmt(t.close_debit)}</td><td class="num">${fmt(t.close_credit)}</td></tr></tfoot></table></div>
+      <div class="actions mt"><button class="btn sm" data-acc="111">Sổ quỹ tiền mặt (111)</button><button class="btn sm" data-acc="112">Sổ tiền gửi (112)</button><button class="btn sm" data-acc="131">Phải thu (131)</button><button class="btn sm" data-acc="331">Phải trả (331)</button><button class="btn sm" data-acc="141">Tạm ứng (141)</button><button class="btn sm" data-acc="154">Dở dang (154)</button></div></div>`;
+    $$('[data-acc]', $('#tbBox')).forEach(el => el.addEventListener('click', (e) => { e.preventDefault(); loadLedger(el.dataset.acc); }));
+    await loadLedger(sessionStorage.getItem('tbAcc') || acc);
+  };
+  $('#fMonth').addEventListener('change', load);
+  $('#csvTb').addEventListener('click', () => csvDownload(`can-doi-so-phat-sinh-${tb.month}.csv`, [
+    ['TK', 'Tên tài khoản', 'Dư Nợ đầu kỳ', 'Dư Có đầu kỳ', 'Phát sinh Nợ', 'Phát sinh Có', 'Dư Nợ cuối kỳ', 'Dư Có cuối kỳ'],
+    ...tb.rows.map(r => [r.acc, r.name, r.open_debit, r.open_credit, r.debit, r.credit, r.close_debit, r.close_credit]),
+    ['', 'Cộng', tb.totals.open_debit, tb.totals.open_credit, tb.totals.debit, tb.totals.credit, tb.totals.close_debit, tb.totals.close_credit],
+  ]));
+  await load();
+}
+
+// ---------- Bút toán khác & số dư đầu kỳ ----------
+async function pageJournals(main) {
+  const d = await api('GET', '/api/journals');
+  const A = C().ACCOUNTS;
+  main.innerHTML = `<div class="page-head"><div><h1>Bút toán khác & số dư đầu kỳ</h1><p class="muted">Dùng cho nghiệp vụ không thuộc công trình: góp vốn, vay, lãi vay, lương văn phòng (Nợ 6422/Có 334), trả lương, nộp thuế, rút tiền ngân hàng về quỹ, khấu hao… Chi phí và doanh thu công trình KHÔNG nhập ở đây.</p></div>
+    <div class="actions">${can('quan_tri', 'ke_toan') ? '<button class="btn" id="addOpen">Nhập số dư đầu kỳ</button><button class="btn primary" id="addJ">+ Bút toán khác</button>' : ''}</div></div>
+    <div class="card"><div class="table-wrap"><table><thead><tr><th>Mã</th><th>Ngày</th><th>Diễn giải</th><th>TK</th><th>Đối tượng</th><th class="num">Nợ</th><th class="num">Có</th><th></th></tr></thead><tbody>
+    ${d.items.map(j => j.lines.map((l, i) => `<tr${i ? ' class="sub"' : ''}><td>${i ? '' : esc(j.code) + (j.kind === 'dau_ky' ? ' <span class="pill gray">Đầu kỳ</span>' : '') + (j.reverses_id ? ' <span class="pill gray">Đảo</span>' : '') + (j.reversed_by_id ? ' <span class="pill gray">Đã huỷ</span>' : '')}</td><td>${i ? '' : dmy(j.date)}</td><td>${i ? '' : esc(j.description)}</td>
+      <td title="${esc(A[l.acc] || '')}">${esc(l.acc)}</td><td>${esc(l.obj)}</td><td class="num">${l.debit ? money(l.debit) : ''}</td><td class="num">${l.credit ? money(l.credit) : ''}</td>
+      <td>${!i && can('quan_tri', 'ke_toan') && !j.reverses_id && !j.reversed_by_id ? `<button class="btn sm danger" data-void="journals:${j.id}">Huỷ</button>` : ''}</td></tr>`).join('')).join('') || '<tr><td colspan="8" class="muted">Chưa có bút toán.</td></tr>'}
+    </tbody></table></div></div>`;
+  bindLedger(main);
+  const form = (kind) => {
+    const accs = kind === 'dau_ky' ? C().OPENING_ACCOUNTS : C().MANUAL_ACCOUNTS;
+    const accOpts = `<option value="">— TK —</option>` + accs.map(a => `<option value="${a}">${a} · ${esc(A[a])}</option>`).join('');
+    const body = openModal(kind === 'dau_ky' ? 'Số dư đầu kỳ' : 'Bút toán khác', `<form id="jForm"><div class="form-error" hidden></div>
+      ${kind === 'dau_ky' ? '<div class="notice small">Nhập số dư các tài khoản tại ngày bắt đầu dùng phần mềm (thường là ngày đầu tháng). Tài sản/phải thu/tiền ghi bên Nợ; nợ phải trả, vốn góp (4111), lợi nhuận chưa phân phối (421) ghi bên Có. Tổng Nợ phải bằng tổng Có.</div>' : ''}
+      <div class="form-grid"><div><label>Ngày</label><input type="date" name="date" value="${today()}" max="${today()}" required></div>
+      <div><label>Diễn giải</label><input name="description" required value="${kind === 'dau_ky' ? 'Số dư đầu kỳ' : ''}"></div></div>
+      <h3>Các dòng</h3><div id="jLines"></div><button type="button" class="btn sm" id="jAdd">+ Thêm dòng</button>
+      <p class="small" id="jSum"></p>
+      <label class="mt">Chứng từ (không bắt buộc)</label><input type="file" id="jFiles" accept="image/*,application/pdf" multiple>
+      <div class="form-actions"><button type="button" class="btn" data-close>Huỷ</button><button class="btn primary" type="submit">Lưu</button></div></form>`);
+    const f = $('#jForm', body);
+    const sum = () => {
+      const rows = $$('.jl', f);
+      const dsum = rows.reduce((a, r) => a + parseMoney($('.jd', r).value), 0), csum = rows.reduce((a, r) => a + parseMoney($('.jc', r).value), 0);
+      $('#jSum', f).innerHTML = `Tổng Nợ: <b>${fmt(dsum)}</b> · Tổng Có: <b>${fmt(csum)}</b> ${dsum === csum && dsum > 0 ? '<span class="pill ok">Cân</span>' : '<span class="pill bad">Chưa cân</span>'}`;
+    };
+    const addLine = () => {
+      const d2 = document.createElement('div'); d2.className = 'form-grid jl';
+      d2.innerHTML = `<div><label>Tài khoản</label><select class="ja">${accOpts}</select></div><div><label>Đối tượng (tên người, ngân hàng…)</label><input class="jo"></div>
+        <div><label>Nợ</label><input class="jd" data-money inputmode="numeric"></div><div><label>Có</label><input class="jc" data-money inputmode="numeric"></div>`;
+      $('#jLines', f).appendChild(d2);
+    };
+    addLine(); addLine();
+    $('#jAdd', f).addEventListener('click', addLine);
+    f.addEventListener('input', sum);
+    $('[data-close]', f).addEventListener('click', closeModal);
+    f.addEventListener('submit', (e) => { e.preventDefault(); submitting(f, async () => {
+      const lines = $$('.jl', f).map(r => ({ acc: $('.ja', r).value, obj: $('.jo', r).value, debit: parseMoney($('.jd', r).value), credit: parseMoney($('.jc', r).value) })).filter(l => l.acc || l.debit || l.credit);
+      const r = await api('POST', '/api/journals', { kind, date: $('[name=date]', f).value, description: $('[name=description]', f).value, lines, attachments: await readFiles($('#jFiles', f)) });
+      toast(`Đã ghi ${r.code}`); closeModal(); route();
+    }); });
+  };
+  $('#addJ')?.addEventListener('click', () => form('khac'));
+  $('#addOpen')?.addEventListener('click', () => form('dau_ky'));
+}
+
+function budgetForm(p, s) {
+  const body = openModal(`Dự toán ${p.code}`, `<form id="bgForm"><div class="form-error" hidden></div>
+    <p class="small muted">Dự toán chi phí (trước thuế) theo từng khoản. Phần mềm so với thực tế và cảnh báo khi vượt.</p>
+    <div class="form-grid">${Object.entries(C().PROJECT_CATEGORIES).map(([k, l]) => `<div><label>${esc(l)}</label><input name="${k}" data-money inputmode="numeric" value="${s.budget[k] ? fmt(s.budget[k]) : ''}"></div>`).join('')}</div>
+    <p class="small" id="bgSum"></p>
+    <div class="form-actions"><button type="button" class="btn" data-close>Huỷ</button><button class="btn primary" type="submit">Lưu dự toán</button></div></form>`);
+  const f = $('#bgForm', body);
+  const sum = () => { const v = formValues(f); const t = Object.values(v).reduce((a, x) => a + x, 0); $('#bgSum', f).textContent = `Tổng dự toán: ${fmt(t)} đ · Lãi gộp dự kiến: ${fmt(p.contract_value - t)} đ${p.contract_value ? ` (${pctTxt(Math.round((p.contract_value - t) * 10000 / p.contract_value) / 100)})` : ''}`; };
+  f.addEventListener('input', sum); sum();
+  $('[data-close]', f).addEventListener('click', closeModal);
+  f.addEventListener('submit', (e) => { e.preventDefault(); submitting(f, async () => { await api('PUT', `/api/projects/${p.id}/budget`, { lines: formValues(f) }); toast('Đã lưu dự toán'); closeModal(); route(); }); });
 }
 
 // ---------- Ứng dụng cài trên máy (PWA) + khoá phóng to ----------

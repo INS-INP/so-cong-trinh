@@ -2,14 +2,15 @@
 import { migrate } from './schema.js';
 import {
   ROLES, PROJECT_CATEGORIES, OVERHEAD_CATEGORIES, CATEGORIES, PAY_METHODS, CASH_METHODS, PROJECT_STATUS,
-  COST_STATUS, PARTNER_KIND, DEFAULT_SETTINGS,
+  COST_STATUS, PARTNER_KIND, DEFAULT_SETTINGS, ADVANCE_KIND,
 } from './constants.js';
+import { ACCOUNTS, MANUAL_ACCOUNTS, OPENING_ACCOUNTS, EVIDENCE } from './accounts.js';
 import {
   HttpError, bad, vnNow, vnToday, isDate, isMonth, monthOf, nextMonth, monthEnd, toMoney, str, oneOf,
   b64ToBytes, sha256Hex,
 } from './util.js';
 import { hashPassword, verifyPassword, checkPasswordStrength, randomHex, tokenHash } from './auth.js';
-import { monthlyReport, projectsSummary, journal, balances, insolarReconcile } from './report.js';
+import { monthlyReport, projectsSummary, journal, balances, insolarReconcile, trialBalance, ledger, taxReport, advanceBalances, vatBlocked } from './report.js';
 import { parseEInvoice } from '../public/einvoice.js';
 
 const SESSION_DAYS = 30;
@@ -27,7 +28,9 @@ const json = (obj, status = 200, headers = {}) =>
 function fingerprint(rep) {
   return {
     projects: rep.projects.map(r => [r.id, r.kind, r.month, r.to_date, r.result]),
-    overhead: rep.overhead, completed_gross: rep.completed_gross, adjustments: rep.adjustments, wip: rep.wip, totals: rep.totals,
+    overhead: rep.overhead, completed_gross: rep.completed_gross, adjustments: rep.adjustments, wip: rep.wip,
+    revenue: rep.totals.revenue, cost: rep.totals.cost, receipts: rep.totals.receipts, payments: rep.totals.payments,
+    manual: [rep.overhead_manual || 0, rep.other_income || 0, rep.other_expense || 0, rep.cit || 0],
   };
 }
 
@@ -148,6 +151,16 @@ export class App {
         ['GET', /^\/api\/(revenues|receipts|payments)$/, (t) => this.listLedger(ctx, t)],
         ['POST', /^\/api\/(revenues|receipts|payments)$/, (t) => this.createLedger(ctx, t)],
         ['POST', /^\/api\/(revenues|receipts|payments)\/(\d+)\/void$/, (t, id) => this.voidEntry(ctx, t, +id)],
+        ['PUT', /^\/api\/projects\/(\d+)\/budget$/, (id) => this.saveBudget(ctx, +id)],
+        ['GET', /^\/api\/advances$/, () => this.listAdvances(ctx)],
+        ['POST', /^\/api\/advances$/, () => this.createAdvance(ctx)],
+        ['POST', /^\/api\/advances\/(\d+)\/void$/, (id) => this.voidEntry(ctx, 'advances', +id)],
+        ['GET', /^\/api\/journals$/, () => this.listJournals(ctx)],
+        ['POST', /^\/api\/journals$/, () => this.createJournal(ctx)],
+        ['POST', /^\/api\/journals\/(\d+)\/void$/, (id) => this.voidEntry(ctx, 'journals', +id)],
+        ['GET', /^\/api\/report\/trial$/, () => this.reportTrial(ctx)],
+        ['GET', /^\/api\/report\/ledger$/, () => this.reportLedger(ctx)],
+        ['GET', /^\/api\/report\/tax$/, () => this.reportTax(ctx)],
         ['GET', /^\/api\/attachments$/, () => this.listAttachments(ctx)],
         ['POST', /^\/api\/attachments$/, () => this.addAttachments(ctx)],
         ['GET', /^\/api\/attachments\/(\d+)$/, (id) => this.getAttachment(ctx, +id)],
@@ -254,7 +267,7 @@ export class App {
       me: user,
       today: this.today(),
       settings: s,
-      constants: { ROLES, PROJECT_CATEGORIES, OVERHEAD_CATEGORIES, CATEGORIES, PAY_METHODS, CASH_METHODS, PROJECT_STATUS, COST_STATUS, PARTNER_KIND },
+      constants: { ROLES, PROJECT_CATEGORIES, OVERHEAD_CATEGORIES, CATEGORIES, PAY_METHODS, CASH_METHODS, PROJECT_STATUS, COST_STATUS, PARTNER_KIND, ADVANCE_KIND, ACCOUNTS, MANUAL_ACCOUNTS, OPENING_ACCOUNTS, EVIDENCE },
       users: this.db.all(`SELECT id, username, full_name, role, active FROM users ORDER BY id`),
       shareholders: isChiHuy ? [] : this.db.all(`SELECT id, name, pct_bp, note FROM shareholders ORDER BY id`),
       partners: this.db.all(`SELECT * FROM partners ORDER BY name`),
@@ -319,6 +332,11 @@ export class App {
     const w = Number(body.warranty_pct ?? before.warranty_pct);
     if (!Number.isFinite(w) || w < 0 || w > 20) throw bad('Tỷ lệ dự phòng bảo hành phải từ 0 đến 20%');
     next.warranty_pct = String(Math.round(w * 100) / 100);
+    next.cash_limit = String(toMoney(body.cash_limit ?? before.cash_limit, { field: 'Ngưỡng thanh toán không dùng tiền mặt' }));
+    next.pit_threshold = String(toMoney(body.pit_threshold ?? before.pit_threshold, { field: 'Ngưỡng khấu trừ TNCN' }));
+    const pr = Number(body.pit_rate ?? before.pit_rate);
+    if (!Number.isFinite(pr) || pr < 0 || pr > 35) throw bad('Tỷ lệ khấu trừ TNCN không hợp lệ');
+    next.pit_rate = String(pr);
     if (next.warranty_pct !== before.warranty_pct && before.locked_through) {
       // đổi tỷ lệ chỉ ảnh hưởng tháng chưa khoá (tháng đã khoá giữ nguyên ảnh chụp số liệu)
     }
@@ -357,6 +375,7 @@ export class App {
       mst: str(body.mst, { field: 'MST', max: 20 }).replace(/\s/g, ''),
       address: str(body.address, { field: 'địa chỉ', max: 300 }),
       phone: str(body.phone, { field: 'điện thoại', max: 30 }),
+      id_no: str(body.id_no, { field: 'số CCCD', max: 20 }).replace(/\s/g, ''),
     };
   }
   savePartner({ user, body, ip }, id) {
@@ -370,12 +389,12 @@ export class App {
       const before = this.db.one(`SELECT * FROM partners WHERE id = ?`, id);
       if (!before) throw new HttpError(404, 'Không tìm thấy đối tác');
       if (user.role === 'chi_huy') throw new HttpError(403, 'Chỉ Kế toán/Quản trị được sửa đối tác');
-      this.db.run(`UPDATE partners SET kind = ?, name = ?, mst = ?, address = ?, phone = ? WHERE id = ?`, p.kind, p.name, p.mst, p.address, p.phone, id);
+      this.db.run(`UPDATE partners SET kind = ?, name = ?, mst = ?, address = ?, phone = ?, id_no = ? WHERE id = ?`, p.kind, p.name, p.mst, p.address, p.phone, p.id_no, id);
       this.audit(user, 'sua', 'doi_tac', id, before, p, ip);
       return { id };
     }
-    const nid = this.db.one(`INSERT INTO partners (kind, name, mst, address, phone, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id`,
-      p.kind, p.name, p.mst, p.address, p.phone, vnNow(this.now())).id;
+    const nid = this.db.one(`INSERT INTO partners (kind, name, mst, address, phone, id_no, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+      p.kind, p.name, p.mst, p.address, p.phone, p.id_no, vnNow(this.now())).id;
     this.audit(user, 'tao', 'doi_tac', nid, null, p, ip);
     return { id: nid };
   }
@@ -468,11 +487,11 @@ export class App {
       ownerType, ownerId, a.name, a.mime, a.data.length, a.data, user.id, vnNow(this.now())));
   }
   canSeeOwner(user, ownerType, ownerId) {
-    const tables = { costs: 'costs', revenues: 'revenues', receipts: 'receipts', payments: 'payments' };
+    const tables = { costs: 'costs', revenues: 'revenues', receipts: 'receipts', payments: 'payments', advances: 'advances', journals: 'journals' };
     if (!tables[ownerType]) return false;
     const row = this.db.one(`SELECT created_by FROM ${tables[ownerType]} WHERE id = ?`, ownerId);
     if (!row) return false;
-    if (user.role === 'chi_huy') return ownerType === 'costs' && row.created_by === user.id;
+    if (user.role === 'chi_huy') return (ownerType === 'costs' && row.created_by === user.id) || (ownerType === 'advances' && this.db.one(`SELECT user_id FROM advances WHERE id = ?`, ownerId).user_id === user.id);
     return true;
   }
   listAttachments({ user, q }) {
@@ -528,16 +547,50 @@ export class App {
       if (s.insolar_mst && pt.mst !== s.insolar_mst) throw bad('Loại "Vật tư lấy của INSOLAR" phải chọn đúng nhà cung cấp INSOLAR (theo MST trong Cài đặt)');
     }
     const net = toMoney(body.amount_net, { field: 'Tiền trước thuế' });
-    const vat = toMoney(body.vat ?? 0, { field: 'Thuế GTGT' });
+    let vat = toMoney(body.vat ?? 0, { field: 'Thuế GTGT' });
     if (net <= 0) throw bad('Tiền trước thuế phải lớn hơn 0');
     if (vat > net) throw bad('Thuế GTGT lớn hơn tiền hàng — kiểm tra lại');
+    // Chi phí không có hoá đơn GTGT: không có thuế GTGT đầu vào; mua của cá nhân → Bảng kê 01/TNDN; thuê khoán cá nhân → khấu trừ TNCN.
+    const evidence = oneOf(body.evidence || 'hoa_don_gtgt', EVIDENCE, 'Loại chứng từ');
+    if (evidence !== 'hoa_don_gtgt' && vat) throw bad('Chỉ hoá đơn GTGT mới có thuế GTGT đầu vào. Với loại chứng từ này, nhập thuế = 0.');
+    if (['bang_ke', 'nhan_cong_khoan'].includes(evidence)) {
+      if (!partnerId) throw bad('Chọn người bán/người nhận tiền (họ tên, địa chỉ, số CCCD) để lên bảng kê');
+      const pt = this.db.one(`SELECT address, id_no FROM partners WHERE id = ?`, partnerId);
+      if (!pt.address && !pt.id_no) throw bad('Người bán/người nhận cần có địa chỉ hoặc số CCCD (sửa trong mục Nhà cung cấp)');
+    }
+    let pit = 0;
+    if (evidence === 'nhan_cong_khoan' && !body.pit_exempt) {
+      pit = body.pit === undefined || body.pit === '' || body.pit === null
+        ? (net >= Number(s.pit_threshold || 0) ? Math.round(net * Number(s.pit_rate || 0) / 100) : 0)
+        : toMoney(body.pit, { field: 'Thuế TNCN khấu trừ' });
+      if (pit > net) throw bad('Thuế TNCN khấu trừ lớn hơn tiền công');
+    }
+    let advanceUserId = null;
+    if (payMethod === 'tam_ung') {
+      advanceUserId = user.role === 'chi_huy' ? user.id : Number(body.advance_user_id || user.id);
+      if (!this.db.one(`SELECT id FROM users WHERE id = ?`, advanceUserId)) throw bad('Người tạm ứng không tồn tại');
+    }
     return {
       date, project_id: projectId, category: body.category, partner_id: partnerId,
       description: str(body.description, { field: 'nội dung', required: true, max: 500 }),
-      amount_net: net, vat, pay_method: payMethod,
+      amount_net: net, vat, pay_method: payMethod, evidence, pit, advance_user_id: advanceUserId,
       invoice_no: str(body.invoice_no, { field: 'số hoá đơn', max: 50 }),
       invoice_date: body.invoice_date && isDate(body.invoice_date) ? body.invoice_date : '',
     };
+  }
+  costWarnings(c) {
+    const s = this.settings();
+    const w = [];
+    if (vatBlocked(c, Number(s.cash_limit) || 0)) w.push(`Trả tiền mặt từ ${Number(s.cash_limit).toLocaleString('vi-VN')}đ: thuế GTGT đầu vào của khoản này KHÔNG được khấu trừ. Nên chuyển khoản.`);
+    if (c.evidence === 'khong_hop_le') w.push('Khoản chi không có chứng từ hợp lệ: không được trừ khi tính thuế TNDN.');
+    if (c.project_id) {
+      const b = this.db.one(`SELECT amount FROM budgets WHERE project_id = ? AND category = ?`, c.project_id, c.category);
+      if (b && b.amount > 0) {
+        const used = Number(this.db.one(`SELECT COALESCE(SUM(amount_net), 0) AS v FROM costs WHERE project_id = ? AND category = ? AND status IN ('da_duyet', 'cho_duyet')`, c.project_id, c.category).v);
+        if (used > b.amount) w.push(`Vượt dự toán "${CATEGORIES[c.category]}": đã dùng ${used.toLocaleString('vi-VN')} / ${b.amount.toLocaleString('vi-VN')}đ.`);
+      }
+    }
+    return w;
   }
   needsApproval(c, creator) {
     const threshold = Number(this.settings().approval_threshold) || 0;
@@ -546,9 +599,9 @@ export class App {
   insertCost(user, c, extra = {}) {
     const pending = this.needsApproval(c, user);
     const now = vnNow(this.now());
-    const row = this.db.one(`INSERT INTO costs (code, date, project_id, category, partner_id, description, amount_net, vat, pay_method, invoice_no, invoice_date, status, source, einvoice_key, created_by, created_at, approved_by, approved_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id, code, status`,
-      this.nextCode('CP'), c.date, c.project_id, c.category, c.partner_id, c.description, c.amount_net, c.vat, c.pay_method, c.invoice_no, c.invoice_date,
+    const row = this.db.one(`INSERT INTO costs (code, date, project_id, category, partner_id, description, amount_net, vat, pay_method, invoice_no, invoice_date, evidence, pit, advance_user_id, status, source, einvoice_key, created_by, created_at, approved_by, approved_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id, code, status`,
+      this.nextCode('CP'), c.date, c.project_id, c.category, c.partner_id, c.description, c.amount_net, c.vat, c.pay_method, c.invoice_no, c.invoice_date, c.evidence, c.pit, c.advance_user_id,
       pending ? 'cho_duyet' : 'da_duyet', extra.source || 'tay', extra.einvoice_key || null, user.id, now,
       pending ? null : user.id, pending ? null : now);
     return row;
@@ -563,7 +616,7 @@ export class App {
       this.saveAttachments(user, 'costs', row.id, atts);
       this.audit(user, 'tao', 'chi_phi', row.code, null, { ...c, status: row.status, files: atts.length }, ip);
     });
-    return row;
+    return { ...row, warnings: this.costWarnings(c) };
   }
   previewEInvoice({ user, body }) {
     this.need(user, ['quan_tri', 'ke_toan', 'chi_huy']);
@@ -598,7 +651,8 @@ export class App {
       const c = this.costFrom({
         date: body.date || inv.date, project_id: body.project_id, category, partner_id: partner.id,
         description: str(body.description, { max: 500 }) || `Hoá đơn ${inv.series} số ${inv.number} — ${inv.seller.name}`,
-        amount_net: inv.net, vat: inv.vat, pay_method: body.pay_method || 'cong_no',
+        amount_net: inv.net, vat: inv.vat, pay_method: body.pay_method || 'cong_no', advance_user_id: body.advance_user_id,
+        evidence: inv.template === '2' ? 'hoa_don_ban_hang' : 'hoa_don_gtgt',
         invoice_no: `${inv.series}-${inv.number}`, invoice_date: inv.date,
       }, user);
       if (c.amount_net <= 0) throw bad('Hoá đơn có tổng tiền bằng 0 hoặc âm');
@@ -608,6 +662,7 @@ export class App {
       const xmlBytes = new TextEncoder().encode(xml);
       this.saveAttachments(user, 'costs', row.id, [{ name: `HD-${inv.series}-${inv.number}.xml`, mime: 'application/xml', data: xmlBytes }, ...extraAtts]);
       this.audit(user, 'nhap_hddt', 'chi_phi', row.code, null, { ...c, status: row.status, key: inv.key }, ip);
+      row.warnings = this.costWarnings(c);
     });
     return row;
   }
@@ -644,8 +699,8 @@ export class App {
     if (before.source === 'hddt' && (c.amount_net !== before.amount_net || c.vat !== before.vat || c.partner_id !== before.partner_id)) {
       throw bad('Khoản chi nhập từ hoá đơn điện tử không được sửa số tiền/nhà cung cấp');
     }
-    this.db.run(`UPDATE costs SET date = ?, project_id = ?, category = ?, partner_id = ?, description = ?, amount_net = ?, vat = ?, pay_method = ?, invoice_no = ?, invoice_date = ? WHERE id = ?`,
-      c.date, c.project_id, c.category, c.partner_id, c.description, c.amount_net, c.vat, c.pay_method, c.invoice_no, c.invoice_date, id);
+    this.db.run(`UPDATE costs SET date = ?, project_id = ?, category = ?, partner_id = ?, description = ?, amount_net = ?, vat = ?, pay_method = ?, invoice_no = ?, invoice_date = ?, evidence = ?, pit = ?, advance_user_id = ? WHERE id = ?`,
+      c.date, c.project_id, c.category, c.partner_id, c.description, c.amount_net, c.vat, c.pay_method, c.invoice_no, c.invoice_date, c.evidence, c.pit, c.advance_user_id, id);
     this.audit(user, 'sua', 'chi_phi', before.code, before, c, ip);
     return { ok: true };
   }
@@ -739,8 +794,8 @@ export class App {
   // Huỷ chứng từ đã ghi sổ = lập bút toán đảo (số âm), không xoá bản gốc.
   voidEntry({ user, body, ip }, t, id) {
     this.need(user, BOOKKEEPERS);
-    const entity = { costs: 'chi_phi', revenues: 'doanh_thu', receipts: 'thu_tien', payments: 'tra_ncc' }[t];
-    const prefix = { costs: 'CP', revenues: 'DT', receipts: 'PT', payments: 'PC' }[t];
+    const entity = { costs: 'chi_phi', revenues: 'doanh_thu', receipts: 'thu_tien', payments: 'tra_ncc', advances: 'tam_ung', journals: 'but_toan' }[t];
+    const prefix = { costs: 'CP', revenues: 'DT', receipts: 'PT', payments: 'PC', advances: 'TU', journals: 'BT' }[t];
     const o = this.db.one(`SELECT * FROM ${t} WHERE id = ?`, id);
     if (!o) throw new HttpError(404, 'Không tìm thấy');
     if (o.status !== 'da_duyet') throw bad(t === 'costs' && o.status === 'cho_duyet' ? 'Khoản chưa ghi sổ: dùng "Từ chối" thay vì huỷ' : 'Chứng từ chưa ghi sổ');
@@ -756,9 +811,9 @@ export class App {
       const code = this.nextCode(prefix);
       const desc = `Huỷ ${o.code}: ${reason}`.slice(0, 500);
       if (t === 'costs') {
-        row = this.db.one(`INSERT INTO costs (code, date, project_id, category, partner_id, description, amount_net, vat, pay_method, invoice_no, invoice_date, status, reverses_id, reason, source, created_by, created_at, approved_by, approved_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'da_duyet', ?, ?, 'dao', ?, ?, ?, ?) RETURNING id, code`,
-          code, date, o.project_id, o.category, o.partner_id, desc, -o.amount_net, -o.vat, o.pay_method, o.invoice_no, o.invoice_date, o.id, reason, user.id, now, user.id, now);
+        row = this.db.one(`INSERT INTO costs (code, date, project_id, category, partner_id, description, amount_net, vat, pay_method, invoice_no, invoice_date, evidence, pit, advance_user_id, status, reverses_id, reason, source, created_by, created_at, approved_by, approved_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'da_duyet', ?, ?, 'dao', ?, ?, ?, ?) RETURNING id, code`,
+          code, date, o.project_id, o.category, o.partner_id, desc, -o.amount_net, -o.vat, o.pay_method, o.invoice_no, o.invoice_date, o.evidence, -o.pit, o.advance_user_id, o.id, reason, user.id, now, user.id, now);
         this.db.run(`UPDATE costs SET reversed_by_id = ?, einvoice_key = NULL WHERE id = ?`, row.id, o.id);
       } else if (t === 'revenues') {
         row = this.db.one(`INSERT INTO revenues (code, date, project_id, description, amount_net, vat, invoice_no, status, reverses_id, reason, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'da_duyet', ?, ?, ?, ?) RETURNING id, code`,
@@ -768,10 +823,21 @@ export class App {
         row = this.db.one(`INSERT INTO receipts (code, date, project_id, amount, method, description, status, reverses_id, reason, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, 'da_duyet', ?, ?, ?, ?) RETURNING id, code`,
           code, date, o.project_id, -o.amount, o.method, desc, o.id, reason, user.id, now);
         this.db.run(`UPDATE receipts SET reversed_by_id = ? WHERE id = ?`, row.id, o.id);
-      } else {
+      } else if (t === 'payments') {
         row = this.db.one(`INSERT INTO payments (code, date, partner_id, amount, method, description, status, reverses_id, reason, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, 'da_duyet', ?, ?, ?, ?) RETURNING id, code`,
           code, date, o.partner_id, -o.amount, o.method, desc, o.id, reason, user.id, now);
         this.db.run(`UPDATE payments SET reversed_by_id = ? WHERE id = ?`, row.id, o.id);
+      } else if (t === 'advances') {
+        row = this.db.one(`INSERT INTO advances (code, date, user_id, kind, amount, method, description, status, reverses_id, reason, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'da_duyet', ?, ?, ?, ?) RETURNING id, code`,
+          code, date, o.user_id, o.kind, -o.amount, o.method, desc, o.id, reason, user.id, now);
+        this.db.run(`UPDATE advances SET reversed_by_id = ? WHERE id = ?`, row.id, o.id);
+      } else {
+        // bút toán đảo: đổi bên Nợ/Có
+        row = this.db.one(`INSERT INTO journals (code, date, kind, description, status, reverses_id, reason, created_by, created_at) VALUES (?, ?, ?, ?, 'da_duyet', ?, ?, ?, ?) RETURNING id, code`,
+          code, date, o.kind, desc, o.id, reason, user.id, now);
+        this.db.all(`SELECT * FROM journal_lines WHERE journal_id = ?`, o.id).forEach(l =>
+          this.db.run(`INSERT INTO journal_lines (journal_id, acc, obj, debit, credit) VALUES (?, ?, ?, ?, ?)`, row.id, l.acc, l.obj, l.credit, l.debit));
+        this.db.run(`UPDATE journals SET reversed_by_id = ? WHERE id = ?`, row.id, o.id);
       }
       this.audit(user, 'huy', entity, o.code, { code: o.code }, { reversal: row.code, date, reason }, ip);
     });
@@ -785,7 +851,11 @@ export class App {
       projects: this.db.all(`SELECT * FROM projects ORDER BY code`),
       partners: this.db.all(`SELECT * FROM partners`),
       shareholders: this.db.all(`SELECT name, pct_bp FROM shareholders ORDER BY id`),
-      costs: this.db.all(`SELECT id, code, date, project_id, category, partner_id, description, amount_net, vat, pay_method FROM costs WHERE status = 'da_duyet'`),
+      users: this.db.all(`SELECT id, full_name FROM users`),
+      budgets: this.db.all(`SELECT project_id, category, amount FROM budgets`),
+      advances: this.db.all(`SELECT id, code, date, user_id, kind, amount, method, description FROM advances WHERE status = 'da_duyet'`),
+      journals: this.journalsWithLines(`WHERE status = 'da_duyet'`),
+      costs: this.db.all(`SELECT id, code, date, project_id, category, partner_id, description, amount_net, vat, pay_method, evidence, pit, advance_user_id FROM costs WHERE status = 'da_duyet'`),
       revenues: this.db.all(`SELECT id, code, date, project_id, description, amount_net, vat FROM revenues WHERE status = 'da_duyet'`),
       receipts: this.db.all(`SELECT id, code, date, project_id, amount, method, description FROM receipts WHERE status = 'da_duyet'`),
       payments: this.db.all(`SELECT id, code, date, partner_id, amount, method, description FROM payments WHERE status = 'da_duyet'`),
@@ -825,7 +895,10 @@ export class App {
     const m = this.today().slice(0, 7);
     const pendingWhere = user.role === 'chi_huy' ? `AND created_by = ${Number(user.id)}` : '';
     const pending = this.db.all(`SELECT id, code, date, project_id, description, amount_net, vat, created_by FROM costs WHERE status = 'cho_duyet' ${pendingWhere} ORDER BY date LIMIT 50`);
-    if (user.role === 'chi_huy') return { month: m, pending, chi_huy: true };
+    if (user.role === 'chi_huy') {
+      const adv = advanceBalances(this.ledgerData(), this.db.all(`SELECT pay_method, advance_user_id, amount_net, vat, pit FROM costs WHERE status = 'cho_duyet'`)).find(a => a.user_id === user.id) || null;
+      return { month: m, pending, chi_huy: true, advance: adv };
+    }
     const rep = monthlyReport(this.ledgerData(), m);
     const s = this.settings();
     return { month: m, pending, report: rep, locked_through: s.locked_through };
@@ -876,6 +949,117 @@ export class App {
     this.db.run(`INSERT INTO signoffs (month, user_id, signed_at, figures_hash, note) VALUES (?, ?, ?, ?, ?)`, m, user.id, vnNow(this.now()), lock.figures_hash, note);
     this.audit(user, 'ky_xac_nhan', 'thang', m, null, { hash: lock.figures_hash, note }, ip);
     return { ok: true };
+  }
+
+  journalsWithLines(where, ...args) {
+    const js = this.db.all(`SELECT * FROM journals ${where} ORDER BY date, id`, ...args);
+    if (!js.length) return [];
+    const lines = this.db.all(`SELECT * FROM journal_lines WHERE journal_id IN (${js.map(j => Number(j.id)).join(',')}) ORDER BY id`);
+    return js.map(j => ({ ...j, lines: lines.filter(l => l.journal_id === j.id) }));
+  }
+
+  // ---------- dự toán công trình ----------
+  saveBudget({ user, body, ip }, id) {
+    this.need(user, BOOKKEEPERS);
+    if (!this.db.one(`SELECT id FROM projects WHERE id = ?`, id)) throw new HttpError(404, 'Không tìm thấy công trình');
+    const lines = body.lines && typeof body.lines === 'object' ? body.lines : {};
+    const next = {};
+    for (const k of Object.keys(PROJECT_CATEGORIES)) next[k] = toMoney(lines[k] ?? 0, { field: 'Dự toán ' + PROJECT_CATEGORIES[k] });
+    const before = this.db.all(`SELECT category, amount FROM budgets WHERE project_id = ?`, id);
+    this.db.tx(() => {
+      this.db.run(`DELETE FROM budgets WHERE project_id = ?`, id);
+      Object.entries(next).forEach(([k, v]) => { if (v) this.db.run(`INSERT INTO budgets (project_id, category, amount) VALUES (?, ?, ?)`, id, k, v); });
+    });
+    this.audit(user, 'du_toan', 'cong_trinh', id, before, next, ip);
+    return { ok: true };
+  }
+
+  // ---------- tạm ứng (TK 141) ----------
+  listAdvances({ user, q }) {
+    const where = [], args = [];
+    if (user.role === 'chi_huy') { where.push('user_id = ?'); args.push(user.id); }
+    if (q.month && isMonth(q.month)) { where.push('date BETWEEN ? AND ?'); args.push(q.month + '-01', monthEnd(q.month)); }
+    const items = this.db.all(`SELECT x.*, (SELECT COUNT(*) FROM attachments a WHERE a.owner_type = 'advances' AND a.owner_id = x.id) AS files FROM advances x ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY date DESC, id DESC LIMIT 2000`, ...args);
+    let bal = advanceBalances(this.ledgerData(), this.db.all(`SELECT pay_method, advance_user_id, amount_net, vat, pit FROM costs WHERE status = 'cho_duyet'`));
+    if (user.role === 'chi_huy') bal = bal.filter(b => b.user_id === user.id);
+    return { items, balances: bal };
+  }
+  createAdvance({ user, body, ip }) {
+    this.need(user, BOOKKEEPERS);
+    const date = body.date;
+    this.assertDate(date, 'Ngày');
+    this.assertOpen(date);
+    const userId = Number(body.user_id);
+    if (!this.db.one(`SELECT id FROM users WHERE id = ?`, userId)) throw bad('Chọn người nhận tạm ứng');
+    const kind = oneOf(body.kind, ADVANCE_KIND, 'Loại');
+    const amount = toMoney(body.amount, { field: 'Số tiền' });
+    if (amount <= 0) throw bad('Số tiền phải lớn hơn 0');
+    const method = oneOf(body.method, CASH_METHODS, 'Hình thức');
+    const description = str(body.description, { field: 'nội dung', max: 500 });
+    const atts = this.validAttachments(body.attachments, false);
+    let row;
+    this.db.tx(() => {
+      row = this.db.one(`INSERT INTO advances (code, date, user_id, kind, amount, method, description, status, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'da_duyet', ?, ?) RETURNING id, code`,
+        this.nextCode('TU'), date, userId, kind, amount, method, description, user.id, vnNow(this.now()));
+      this.saveAttachments(user, 'advances', row.id, atts);
+      this.audit(user, 'tao', 'tam_ung', row.code, null, { date, userId, kind, amount, method, description }, ip);
+    });
+    return row;
+  }
+
+  // ---------- bút toán khác & số dư đầu kỳ ----------
+  listJournals({ user, q }) {
+    this.need(user, VIEWERS);
+    if (q.month && isMonth(q.month)) return { items: this.journalsWithLines(`WHERE date BETWEEN ? AND ?`, q.month + '-01', monthEnd(q.month)).reverse() };
+    return { items: this.journalsWithLines('').reverse().slice(0, 500) };
+  }
+  createJournal({ user, body, ip }) {
+    this.need(user, BOOKKEEPERS);
+    const kind = oneOf(body.kind || 'khac', { khac: 1, dau_ky: 1 }, 'Loại bút toán');
+    const date = body.date;
+    this.assertDate(date, 'Ngày');
+    this.assertOpen(date);
+    const description = str(body.description, { field: 'diễn giải', required: true, max: 500 });
+    const allowed = kind === 'dau_ky' ? OPENING_ACCOUNTS : MANUAL_ACCOUNTS;
+    const lines = (Array.isArray(body.lines) ? body.lines : []).map(l => {
+      const acc = String(l.acc || '');
+      if (!allowed.includes(acc)) throw bad(`Tài khoản ${acc || '(trống)'} không dùng được trong ${kind === 'dau_ky' ? 'số dư đầu kỳ' : 'bút toán khác'}. Chi phí/doanh thu công trình phải nhập qua mục Chi phí/Doanh thu.`);
+      const debit = toMoney(l.debit || 0, { field: 'Số tiền Nợ' }), credit = toMoney(l.credit || 0, { field: 'Số tiền Có' });
+      if ((debit > 0) === (credit > 0)) throw bad('Mỗi dòng chỉ ghi một bên Nợ hoặc Có');
+      return { acc, obj: str(l.obj, { field: 'đối tượng', max: 100 }), debit, credit };
+    });
+    if (lines.length < 2) throw bad('Bút toán cần ít nhất 2 dòng');
+    if (lines.length > 50) throw bad('Tối đa 50 dòng');
+    const d = lines.reduce((a, l) => a + l.debit, 0), c = lines.reduce((a, l) => a + l.credit, 0);
+    if (d !== c) throw bad(`Tổng Nợ (${d.toLocaleString('vi-VN')}) phải bằng tổng Có (${c.toLocaleString('vi-VN')})`);
+    const atts = this.validAttachments(body.attachments, false);
+    let row;
+    this.db.tx(() => {
+      row = this.db.one(`INSERT INTO journals (code, date, kind, description, status, created_by, created_at) VALUES (?, ?, ?, ?, 'da_duyet', ?, ?) RETURNING id, code`,
+        this.nextCode('BT'), date, kind, description, user.id, vnNow(this.now()));
+      lines.forEach(l => this.db.run(`INSERT INTO journal_lines (journal_id, acc, obj, debit, credit) VALUES (?, ?, ?, ?, ?)`, row.id, l.acc, l.obj, l.debit, l.credit));
+      this.saveAttachments(user, 'journals', row.id, atts);
+      this.audit(user, 'tao', 'but_toan', row.code, null, { date, kind, description, lines }, ip);
+    });
+    return row;
+  }
+
+  // ---------- sổ sách ----------
+  reportTrial({ user, q }) {
+    this.need(user, VIEWERS);
+    if (!isMonth(q.m)) throw bad('Tháng không hợp lệ');
+    return trialBalance(this.ledgerData(), q.m);
+  }
+  reportLedger({ user, q }) {
+    this.need(user, VIEWERS);
+    if (!isMonth(q.m)) throw bad('Tháng không hợp lệ');
+    if (!ACCOUNTS[q.acc]) throw bad('Tài khoản không hợp lệ');
+    return ledger(this.ledgerData(), q.acc, q.m);
+  }
+  reportTax({ user, q }) {
+    this.need(user, VIEWERS);
+    if (!isMonth(q.m)) throw bad('Tháng không hợp lệ');
+    return taxReport(this.ledgerData(), q.m);
   }
 
   listAudit({ user, q }) {

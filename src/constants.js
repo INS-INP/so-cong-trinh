@@ -24,9 +24,10 @@ export const OVERHEAD_CATEGORIES = {
 };
 export const CATEGORIES = { ...PROJECT_CATEGORIES, ...OVERHEAD_CATEGORIES };
 
-export const PAY_METHODS = { tien_mat: 'Tiền mặt', chuyen_khoan: 'Chuyển khoản', cong_no: 'Công nợ (chưa trả)' };
+export const PAY_METHODS = { tien_mat: 'Tiền mặt', chuyen_khoan: 'Chuyển khoản', cong_no: 'Công nợ (chưa trả)', tam_ung: 'Tiền tạm ứng (người được tạm ứng đã chi)' };
 export const CASH_METHODS = { tien_mat: 'Tiền mặt', chuyen_khoan: 'Chuyển khoản' };
-export const PAY_ACCOUNT = { tien_mat: '111', chuyen_khoan: '112', cong_no: '331' };
+export const PAY_ACCOUNT = { tien_mat: '111', chuyen_khoan: '112', cong_no: '331', tam_ung: '141' };
+export const ADVANCE_KIND = { cap: 'Cấp tạm ứng', hoan: 'Hoàn ứng (trả lại tiền thừa)' };
 
 export const PROJECT_STATUS = {
   dang_thi_cong: 'Đang thi công',
@@ -46,4 +47,7 @@ export const DEFAULT_SETTINGS = {
   approval_threshold: '20000000',
   warranty_pct: '0',
   locked_through: '',
+  cash_limit: '5000000',
+  pit_rate: '10',
+  pit_threshold: '2000000',
 };

@@ -55,6 +55,25 @@ export const MIGRATIONS = [
      entity_id TEXT NOT NULL DEFAULT '', before_json TEXT NOT NULL DEFAULT '', after_json TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '');
    CREATE INDEX IF NOT EXISTS idx_costs_date ON costs(date);
    CREATE INDEX IF NOT EXISTS idx_costs_project ON costs(project_id);`,
+  // 2: chi phí không hoá đơn (loại chứng từ, khấu trừ TNCN), tạm ứng, dự toán, bút toán khác & số dư đầu kỳ.
+  `ALTER TABLE costs ADD COLUMN evidence TEXT NOT NULL DEFAULT 'hoa_don_gtgt';
+   ALTER TABLE costs ADD COLUMN pit INTEGER NOT NULL DEFAULT 0;
+   ALTER TABLE costs ADD COLUMN advance_user_id INTEGER;
+   ALTER TABLE partners ADD COLUMN id_no TEXT NOT NULL DEFAULT '';
+   CREATE TABLE IF NOT EXISTS advances (
+     id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, date TEXT NOT NULL, user_id INTEGER NOT NULL, kind TEXT NOT NULL,
+     amount INTEGER NOT NULL, method TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+     status TEXT NOT NULL, reverses_id INTEGER, reversed_by_id INTEGER, reason TEXT NOT NULL DEFAULT '',
+     created_by INTEGER NOT NULL, created_at TEXT NOT NULL);
+   CREATE TABLE IF NOT EXISTS budgets (project_id INTEGER NOT NULL, category TEXT NOT NULL, amount INTEGER NOT NULL, PRIMARY KEY (project_id, category));
+   CREATE TABLE IF NOT EXISTS journals (
+     id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE, date TEXT NOT NULL, kind TEXT NOT NULL, description TEXT NOT NULL,
+     status TEXT NOT NULL, reverses_id INTEGER, reversed_by_id INTEGER, reason TEXT NOT NULL DEFAULT '',
+     created_by INTEGER NOT NULL, created_at TEXT NOT NULL);
+   CREATE TABLE IF NOT EXISTS journal_lines (
+     id INTEGER PRIMARY KEY, journal_id INTEGER NOT NULL, acc TEXT NOT NULL, obj TEXT NOT NULL DEFAULT '',
+     debit INTEGER NOT NULL DEFAULT 0, credit INTEGER NOT NULL DEFAULT 0);
+   CREATE INDEX IF NOT EXISTS idx_jl ON journal_lines(journal_id)`,
 ];
 
 export function migrate(db) {

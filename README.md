@@ -14,6 +14,16 @@ Phần mềm kế toán và bóc tách chi phí cho công ty thi công. Chạy t
 - **Báo cáo tháng**: lãi gộp công trình nghiệm thu, điều chỉnh sau nghiệm thu, chi phí chung, dự phòng bảo hành, **lãi ròng và phần chia theo tỷ lệ cổ phần**; phân bổ chi phí chung cho từng công trình.
 - **Sổ nhật ký chung TT133** tự sinh: chi phí công trình Nợ 154, chi phí chung Nợ 6422, nghiệm thu kết chuyển 154 → 632, doanh thu Nợ 131 / Có 511, 33311, thu tiền, trả NCC.
 - **Công nợ**: phải trả từng NCC, phải thu từng công trình, **bảng đối chiếu với INSOLAR theo tháng** (so số với INSOLAR mà không nối hai hệ thống).
+- **Chi phí không có hoá đơn** — chọn "Loại chứng từ" khi nhập:
+  - *Mua của cá nhân/hộ không có hoá đơn* (cát, đá, vật liệu lẻ): chụp biên nhận có họ tên, địa chỉ, chữ ký người bán → tự lên **Bảng kê 01/TNDN** (xuất Excel ở mục Thuế), vẫn được tính chi phí.
+  - *Thuê khoán nhân công cá nhân*: chụp hợp đồng khoán + biên nhận + CCCD → lần trả từ 2 triệu **tự khấu trừ 10% thuế TNCN** (Có 3335), trừ khi có cam kết 08/CK-TNCN; có danh sách để kê khai.
+  - *Chứng từ nội bộ* (bảng lương, phiếu chi) và *Không có chứng từ hợp lệ* (vẫn ghi để quản lý tiền nhưng đánh dấu **không được trừ** khi tính thuế TNDN).
+  - Hoá đơn từ 5 triệu trả **tiền mặt** → cảnh báo thuế GTGT đầu vào không được khấu trừ.
+- **Tạm ứng (TK 141)**: cấp tiền cho chỉ huy, chỉ huy nhập chi phí "trả bằng tiền tạm ứng", hoàn ứng tiền thừa; xem số dư từng người.
+- **Dự toán công trình** theo từng khoản mục: so thực tế, % đã dùng, cảnh báo vượt, lãi gộp dự kiến.
+- **Bút toán khác & số dư đầu kỳ**: góp vốn, vay, lương văn phòng, nộp thuế, rút tiền… (không cho dùng TK công trình 154/511/632); phải cân Nợ = Có; huỷ bằng bút toán đảo.
+- **Bảng cân đối số phát sinh, sổ cái từng tài khoản, sổ quỹ tiền mặt (111), sổ tiền gửi (112)**.
+- **Thuế & bảng kê**: GTGT đầu ra/đầu vào/phải nộp tạm tính, Bảng kê 01/TNDN, TNCN đã khấu trừ, chi phí không được trừ.
 - **Nhật ký thao tác**: ai làm gì, lúc nào, trước/sau.
 - Xuất Excel (CSV), in/PDF báo cáo. Dùng tốt trên điện thoại.
 - **Cài như ứng dụng (PWA)**: menu "Cài ứng dụng lên máy" hướng dẫn cho iPhone (Safari → Chia sẻ → Thêm vào MH chính), Android và máy tính. Khoá phóng to khi dùng trên điện thoại.
