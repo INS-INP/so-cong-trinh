@@ -34,6 +34,25 @@ function fingerprint(rep) {
   };
 }
 
+// Tên máy dễ đọc từ User-Agent (để người dùng nhận ra phiên đăng nhập của mình).
+function deviceName(request) {
+  const ua = request.headers.get('user-agent') || '';
+  const os = /iPhone/.test(ua) ? 'iPhone' : /iPad/.test(ua) ? 'iPad' : /Android/.test(ua) ? 'Android' : /Windows/.test(ua) ? 'Windows' : /Mac OS X/.test(ua) ? 'Mac' : /Linux/.test(ua) ? 'Linux' : 'Máy khác';
+  const br = /Edg\//.test(ua) ? 'Edge' : /CriOS|Chrome\//.test(ua) ? 'Chrome' : /FxiOS|Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : '';
+  return br ? `${os} · ${br}` : os;
+}
+
+// Phiên bản bản ghi: người sửa gửi kèm phiên bản đang thấy; nếu đã có người khác sửa trước → từ chối, không ghi đè.
+function checkVersion(body, current, what = 'Dữ liệu') {
+  if (body.version === undefined || body.version === null || body.version === '') return;
+  if (Number(body.version) !== Number(current)) {
+    const e = new HttpError(409, `${what} vừa được người khác sửa. Đã tải lại bản mới nhất, vui lòng kiểm tra rồi làm lại.`);
+    e.code = 'conflict';
+    throw e;
+  }
+}
+function dupError(msg) { const e = new HttpError(409, msg); e.code = 'possible_duplicate'; return e; }
+
 export class App {
   constructor(db, { now = () => Date.now() } = {}) {
     this.db = db;
@@ -79,18 +98,29 @@ export class App {
     const m = /(?:^|;\s*)sct=([a-f0-9]{64})/.exec(request.headers.get('cookie') || '');
     if (!m) return null;
     const h = await tokenHash(m[1]);
-    const s = this.db.one(`SELECT user_id, expires_at FROM sessions WHERE token_hash = ?`, h);
+    const s = this.db.one(`SELECT user_id, expires_at, last_seen FROM sessions WHERE token_hash = ?`, h);
     if (!s || s.expires_at < this.now()) return null;
     const u = this.db.one(`SELECT id, username, full_name, role, active FROM users WHERE id = ?`, s.user_id);
     if (!u || !u.active) return null;
+    if (this.now() - s.last_seen > 60000) this.db.run(`UPDATE sessions SET last_seen = ? WHERE token_hash = ?`, this.now(), h);
+    u.session = h;
     return u;
   }
-  async newSession(userId) {
+  async mySessions({ user }) {
+    return { items: this.db.all(`SELECT token_hash, device, created_at, last_seen FROM sessions WHERE user_id = ? AND expires_at > ? ORDER BY last_seen DESC`, user.id, this.now())
+      .map(x => ({ current: x.token_hash === user.session, device: x.device, created_at: vnNow(x.created_at), last_seen: x.last_seen ? vnNow(x.last_seen) : '' })) };
+  }
+  async logoutOthers({ user, ip }) {
+    const n = this.db.all(`DELETE FROM sessions WHERE user_id = ? AND token_hash != ? RETURNING token_hash`, user.id, user.session).length;
+    this.audit(user, 'dang_xuat_may_khac', 'nguoi_dung', user.id, null, { so_phien: n }, ip);
+    return { ok: true, count: n };
+  }
+  async newSession(userId, device = '') {
     const token = randomHex(32);
     const now = this.now();
     this.db.run(`DELETE FROM sessions WHERE expires_at < ?`, now);
-    this.db.run(`INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
-      await tokenHash(token), userId, now, now + SESSION_DAYS * 86400000);
+    this.db.run(`INSERT INTO sessions (token_hash, user_id, created_at, expires_at, device, last_seen) VALUES (?, ?, ?, ?, ?, ?)`,
+      await tokenHash(token), userId, now, now + SESSION_DAYS * 86400000, String(device).slice(0, 200), now);
     return `sct=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_DAYS * 86400}`;
   }
 
@@ -122,9 +152,50 @@ export class App {
       if (!user) throw new HttpError(401, 'Phiên đăng nhập đã hết, vui lòng đăng nhập lại');
       ctx.user = user;
 
+      // Chống gửi trùng: mỗi thao tác ghi mang 1 mã (x-idem). Bấm 2 lần, mạng chập chờn gửi lại, hay 2 máy cùng
+      // tài khoản gửi cùng mã → chỉ thực hiện 1 lần, lần sau nhận lại đúng kết quả lần đầu.
+      const idem = method !== 'GET' ? (request.headers.get('x-idem') || '') : '';
+      if (idem) {
+        if (!/^[A-Za-z0-9_-]{8,80}$/.test(idem)) throw bad('Mã chống trùng không hợp lệ');
+        const hit = this.db.one(`SELECT user_id, status, body FROM idempotency WHERE key = ?`, idem);
+        if (hit) {
+          if (hit.user_id !== user.id || hit.status === 0) throw new HttpError(409, 'Thao tác này đang được xử lý, vui lòng đợi');
+          return new Response(hit.body, { status: hit.status, headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-idem-replay': '1' } });
+        }
+        this.db.run(`INSERT INTO idempotency (key, user_id, status, body, at) VALUES (?, ?, 0, '', ?)`, idem, user.id, this.now());
+        let res;
+        try { res = await this.dispatch(ctx, path, method); } catch (e) { this.db.run(`DELETE FROM idempotency WHERE key = ?`, idem); throw e; }
+        if (res.status < 300 && !res.headers.get('set-cookie')) {
+          const text = await res.clone().text();
+          this.db.run(`UPDATE idempotency SET status = ?, body = ? WHERE key = ?`, res.status, text.slice(0, 20000), idem);
+        } else this.db.run(`DELETE FROM idempotency WHERE key = ?`, idem);
+        if (Math.random() < 0.05) this.db.run(`DELETE FROM idempotency WHERE at < ?`, this.now() - 2 * 86400000);
+        return res;
+      }
+      return await this.dispatch(ctx, path, method);
+    } catch (e) {
+      return this.errorResponse(e);
+    }
+  }
+
+  errorResponse(e) {
+    if (e instanceof HttpError) return json({ error: e.message, ...(e.code ? { code: e.code } : {}) }, e.status);
+    if (/UNIQUE constraint failed: costs\.einvoice_key/.test(String(e && e.message))) return json({ error: 'Hoá đơn này đã được nhập trước đó.' }, 409);
+    if (/UNIQUE constraint failed/.test(String(e && e.message))) return json({ error: 'Dữ liệu bị trùng (mã hoặc tên đăng nhập đã tồn tại).' }, 409);
+    console.error(e);
+    return json({ error: 'Lỗi hệ thống. Vui lòng thử lại.' }, 500);
+  }
+
+  async dispatch(ctx, path, method) {
+    const user = ctx.user;
+    try {
+
       if (path === '/api/logout' && method === 'POST') return await this.logout(ctx);
       if (path === '/api/bootstrap' && method === 'GET') return json(this.bootstrap(user));
       if (path === '/api/me/password' && method === 'POST') return await this.changeOwnPassword(ctx);
+      if (path === '/api/me/sessions' && method === 'GET') return json(await this.mySessions(ctx));
+      if (path === '/api/me/logout-others' && method === 'POST') return json(await this.logoutOthers(ctx));
+      if (path === '/api/changes' && method === 'GET') return json({ seq: Number(this.db.one(`SELECT COALESCE(MAX(id), 0) AS n FROM audit WHERE action NOT IN ('dang_nhap', 'dang_nhap_sai')`).n) });
 
       const routes = [
         ['GET', /^\/api\/dashboard$/, () => this.dashboard(ctx)],
@@ -183,11 +254,7 @@ export class App {
       }
       throw new HttpError(404, 'Không tìm thấy');
     } catch (e) {
-      if (e instanceof HttpError) return json({ error: e.message }, e.status);
-      if (/UNIQUE constraint failed: costs\.einvoice_key/.test(String(e && e.message))) return json({ error: 'Hoá đơn này đã được nhập trước đó.' }, 409);
-      if (/UNIQUE constraint failed/.test(String(e && e.message))) return json({ error: 'Dữ liệu bị trùng (mã hoặc tên đăng nhập đã tồn tại).' }, 409);
-      console.error(e);
-      return json({ error: 'Lỗi hệ thống. Vui lòng thử lại.' }, 500);
+      return this.errorResponse(e);
     }
   }
 
@@ -222,7 +289,7 @@ export class App {
     return u;
   }
 
-  async login({ body, ip }) {
+  async login({ body, ip, request }) {
     const username = String(body.username || '').trim().toLowerCase();
     const password = String(body.password || '');
     const u = this.db.one(`SELECT * FROM users WHERE username = ?`, username);
@@ -239,7 +306,7 @@ export class App {
     }
     this.db.run(`UPDATE users SET fail_count = 0, locked_until = 0 WHERE id = ?`, u.id);
     this.audit(u, 'dang_nhap', 'nguoi_dung', u.id, null, null, ip);
-    return json({ ok: true }, 200, { 'set-cookie': await this.newSession(u.id) });
+    return json({ ok: true }, 200, { 'set-cookie': await this.newSession(u.id, deviceName(request)) });
   }
 
   async logout({ request }) {
@@ -264,11 +331,11 @@ export class App {
     const s = this.settings();
     const isChiHuy = user.role === 'chi_huy';
     return {
-      me: user,
+      me: { id: user.id, username: user.username, full_name: user.full_name, role: user.role },
       today: this.today(),
       settings: s,
       constants: { ROLES, PROJECT_CATEGORIES, OVERHEAD_CATEGORIES, CATEGORIES, PAY_METHODS, CASH_METHODS, PROJECT_STATUS, COST_STATUS, PARTNER_KIND, ADVANCE_KIND, ACCOUNTS, MANUAL_ACCOUNTS, OPENING_ACCOUNTS, EVIDENCE },
-      users: this.db.all(`SELECT id, username, full_name, role, active FROM users ORDER BY id`),
+      users: this.db.all(`SELECT id, username, full_name, role, active, version FROM users ORDER BY id`),
       shareholders: isChiHuy ? [] : this.db.all(`SELECT id, name, pct_bp, note FROM shareholders ORDER BY id`),
       partners: this.db.all(`SELECT * FROM partners ORDER BY name`),
       projects: this.db.all(`SELECT * FROM projects ORDER BY id DESC`).map(p => (isChiHuy ? { ...p, contract_value: 0 } : p)),
@@ -291,8 +358,9 @@ export class App {
   }
   updateUser({ user, body, ip }, id) {
     this.need(user, ['quan_tri']);
-    const before = this.db.one(`SELECT id, username, full_name, role, active FROM users WHERE id = ?`, id);
+    const before = this.db.one(`SELECT id, username, full_name, role, active, version FROM users WHERE id = ?`, id);
     if (!before) throw new HttpError(404, 'Không tìm thấy người dùng');
+    checkVersion(body, before.version, 'Người dùng');
     const fullName = str(body.full_name ?? before.full_name, { field: 'họ tên', required: true, max: 100 });
     const role = oneOf(body.role ?? before.role, ROLES, 'Vai trò');
     const active = body.active === undefined ? before.active : (body.active ? 1 : 0);
@@ -300,7 +368,7 @@ export class App {
       const admins = Number(this.db.one(`SELECT COUNT(*) AS n FROM users WHERE role = 'quan_tri' AND active = 1 AND id != ?`, id).n);
       if (!admins) throw bad('Phải còn ít nhất 1 tài khoản Quản trị đang hoạt động');
     }
-    this.db.run(`UPDATE users SET full_name = ?, role = ?, active = ? WHERE id = ?`, fullName, role, active, id);
+    this.db.run(`UPDATE users SET full_name = ?, role = ?, active = ?, version = version + 1 WHERE id = ?`, fullName, role, active, id);
     if (!active) this.db.run(`DELETE FROM sessions WHERE user_id = ?`, id);
     this.audit(user, 'sua', 'nguoi_dung', id, before, { full_name: fullName, role, active }, ip);
     return { ok: true };
@@ -321,6 +389,7 @@ export class App {
   updateSettings({ user, body, ip }) {
     this.need(user, ['quan_tri']);
     const before = this.settings();
+    checkVersion(body, before.version, 'Cài đặt');
     const next = {
       company_name: str(body.company_name ?? before.company_name, { field: 'tên công ty', required: true, max: 200 }),
       company_mst: str(body.company_mst ?? before.company_mst, { field: 'MST', max: 20 }),
@@ -340,6 +409,7 @@ export class App {
     if (next.warranty_pct !== before.warranty_pct && before.locked_through) {
       // đổi tỷ lệ chỉ ảnh hưởng tháng chưa khoá (tháng đã khoá giữ nguyên ảnh chụp số liệu)
     }
+    next.version = String(Number(before.version || 1) + 1);
     this.db.tx(() => Object.entries(next).forEach(([k, v]) => this.setSetting(k, v)));
     this.audit(user, 'sua', 'cai_dat', '', before, next, ip);
     return { ok: true };
@@ -359,7 +429,10 @@ export class App {
     this.need(user, ['quan_tri']);
     const list = this.validShareholders(body.shareholders);
     const before = this.db.all(`SELECT name, pct_bp, note FROM shareholders ORDER BY id`);
+    const sv = this.settings().shareholders_version;
+    checkVersion(body, sv, 'Danh sách cổ đông');
     this.db.tx(() => {
+      this.setSetting('shareholders_version', Number(sv || 1) + 1);
       this.db.run(`DELETE FROM shareholders`);
       list.forEach(s => this.db.run(`INSERT INTO shareholders (name, pct_bp, note) VALUES (?, ?, ?)`, s.name, s.pct_bp, s.note));
     });
@@ -385,11 +458,14 @@ export class App {
       const dup = this.db.one(`SELECT id FROM partners WHERE mst = ? AND id != ?`, p.mst, id || 0);
       if (dup) throw bad('Đã có đối tác với mã số thuế này');
     }
+    if (p.id_no && this.db.one(`SELECT id FROM partners WHERE id_no = ? AND id != ?`, p.id_no, id || 0)) throw bad('Đã có người với số CCCD này');
+    if (!id && this.db.one(`SELECT id FROM partners WHERE lower(name) = lower(?) AND mst = ? AND id_no = ?`, p.name, p.mst, p.id_no)) throw bad('Đối tác này đã có trong danh sách');
     if (id) {
       const before = this.db.one(`SELECT * FROM partners WHERE id = ?`, id);
       if (!before) throw new HttpError(404, 'Không tìm thấy đối tác');
+      checkVersion(body, before.version, 'Đối tác');
       if (user.role === 'chi_huy') throw new HttpError(403, 'Chỉ Kế toán/Quản trị được sửa đối tác');
-      this.db.run(`UPDATE partners SET kind = ?, name = ?, mst = ?, address = ?, phone = ?, id_no = ? WHERE id = ?`, p.kind, p.name, p.mst, p.address, p.phone, p.id_no, id);
+      this.db.run(`UPDATE partners SET kind = ?, name = ?, mst = ?, address = ?, phone = ?, id_no = ?, version = version + 1 WHERE id = ?`, p.kind, p.name, p.mst, p.address, p.phone, p.id_no, id);
       this.audit(user, 'sua', 'doi_tac', id, before, p, ip);
       return { id };
     }
@@ -404,6 +480,7 @@ export class App {
     this.need(user, BOOKKEEPERS);
     const before = id ? this.db.one(`SELECT * FROM projects WHERE id = ?`, id) : null;
     if (id && !before) throw new HttpError(404, 'Không tìm thấy công trình');
+    if (before) checkVersion(body, before.version, 'Công trình');
     const p = {
       name: str(body.name, { field: 'tên công trình', required: true, max: 200 }),
       customer_id: body.customer_id ? Number(body.customer_id) : null,
@@ -423,7 +500,7 @@ export class App {
     if (p.status === 'da_nghiem_thu' && (!before || before.status !== 'da_nghiem_thu')) throw bad('Dùng nút "Nghiệm thu" để chuyển công trình sang đã nghiệm thu');
     if (before && before.status === 'da_nghiem_thu' && p.status !== 'da_nghiem_thu') throw bad('Dùng nút "Mở lại" để huỷ trạng thái nghiệm thu');
     if (id) {
-      this.db.run(`UPDATE projects SET name = ?, customer_id = ?, address = ?, contract_value = ?, vat_rate = ?, start_date = ?, manager_user_id = ?, note = ?, status = ? WHERE id = ?`,
+      this.db.run(`UPDATE projects SET name = ?, customer_id = ?, address = ?, contract_value = ?, vat_rate = ?, start_date = ?, manager_user_id = ?, note = ?, status = ?, version = version + 1 WHERE id = ?`,
         p.name, p.customer_id, p.address, p.contract_value, p.vat_rate, p.start_date, p.manager_user_id, p.note, p.status, id);
       this.audit(user, 'sua', 'cong_trinh', id, before, p, ip);
       return { id };
@@ -452,7 +529,8 @@ export class App {
     this.assertOpen(date);
     const pending = Number(this.db.one(`SELECT COUNT(*) AS n FROM costs WHERE project_id = ? AND status = 'cho_duyet' AND date <= ?`, id, date).n);
     if (pending) throw bad(`Còn ${pending} khoản chi của công trình đang chờ duyệt. Duyệt hoặc từ chối trước khi nghiệm thu.`);
-    this.db.run(`UPDATE projects SET status = 'da_nghiem_thu', accepted_date = ? WHERE id = ?`, date, id);
+    checkVersion(body, p.version, 'Công trình');
+    this.db.run(`UPDATE projects SET status = 'da_nghiem_thu', accepted_date = ?, version = version + 1 WHERE id = ?`, date, id);
     this.audit(user, 'nghiem_thu', 'cong_trinh', id, { status: p.status }, { status: 'da_nghiem_thu', accepted_date: date }, ip);
     return { ok: true };
   }
@@ -462,7 +540,7 @@ export class App {
     if (!p || p.status !== 'da_nghiem_thu') throw bad('Công trình chưa nghiệm thu');
     this.assertOpen(p.accepted_date);
     const reason = str(body.reason, { field: 'lý do', required: true, max: 300 });
-    this.db.run(`UPDATE projects SET status = 'dang_thi_cong', accepted_date = NULL WHERE id = ?`, id);
+    this.db.run(`UPDATE projects SET status = 'dang_thi_cong', accepted_date = NULL, version = version + 1 WHERE id = ?`, id);
     this.audit(user, 'mo_lai', 'cong_trinh', id, { status: p.status, accepted_date: p.accepted_date }, { status: 'dang_thi_cong', reason }, ip);
     return { ok: true };
   }
@@ -606,9 +684,23 @@ export class App {
       pending ? null : user.id, pending ? null : now);
     return row;
   }
+  // Chống nhập trùng chứng từ: cùng NCC + cùng số hoá đơn → chặn; cùng người, cùng công trình, cùng số tiền, cùng ngày trong 30 phút → hỏi lại.
+  checkCostDuplicate(c, user, allow) {
+    if (c.invoice_no && c.partner_id) {
+      const d = this.db.one(`SELECT code FROM costs WHERE partner_id = ? AND lower(invoice_no) = lower(?) AND status IN ('cho_duyet', 'da_duyet') AND reverses_id IS NULL AND reversed_by_id IS NULL`, c.partner_id, c.invoice_no);
+      if (d) throw new HttpError(409, `Hoá đơn số ${c.invoice_no} của nhà cung cấp này đã nhập ở ${d.code}.`);
+    }
+    if (!allow) {
+      const since = vnNow(this.now() - 30 * 60000);
+      const d = this.db.one(`SELECT code, created_by FROM costs WHERE date = ? AND amount_net = ? AND category = ? AND COALESCE(project_id, 0) = ? AND status IN ('cho_duyet', 'da_duyet') AND reverses_id IS NULL AND created_at >= ?`,
+        c.date, c.amount_net, c.category, c.project_id || 0, since);
+      if (d) throw dupError(`Có vẻ trùng với ${d.code} vừa nhập (cùng ngày, cùng công trình, cùng loại, cùng số tiền). Vẫn lưu?`);
+    }
+  }
   createCost({ user, body, ip }) {
     this.need(user, ['quan_tri', 'ke_toan', 'chi_huy']);
     const c = this.costFrom(body, user);
+    this.checkCostDuplicate(c, user, !!body.allow_duplicate);
     const atts = this.validAttachments(body.attachments, true);
     let row;
     this.db.tx(() => {
@@ -692,6 +784,7 @@ export class App {
   updateCost({ user, body, ip }, id) {
     const before = this.db.one(`SELECT * FROM costs WHERE id = ?`, id);
     if (!before) throw new HttpError(404, 'Không tìm thấy');
+    checkVersion(body, before.version, 'Khoản chi');
     if (before.status !== 'cho_duyet') throw bad('Chỉ sửa được khoản chi đang chờ duyệt. Khoản đã ghi sổ phải huỷ bằng bút toán đảo.');
     if (!(before.created_by === user.id || BOOKKEEPERS.includes(user.role))) throw new HttpError(403, 'Bạn không có quyền sửa khoản chi này');
     this.assertOpen(before.date);
@@ -699,19 +792,20 @@ export class App {
     if (before.source === 'hddt' && (c.amount_net !== before.amount_net || c.vat !== before.vat || c.partner_id !== before.partner_id)) {
       throw bad('Khoản chi nhập từ hoá đơn điện tử không được sửa số tiền/nhà cung cấp');
     }
-    this.db.run(`UPDATE costs SET date = ?, project_id = ?, category = ?, partner_id = ?, description = ?, amount_net = ?, vat = ?, pay_method = ?, invoice_no = ?, invoice_date = ?, evidence = ?, pit = ?, advance_user_id = ? WHERE id = ?`,
+    this.db.run(`UPDATE costs SET date = ?, project_id = ?, category = ?, partner_id = ?, description = ?, amount_net = ?, vat = ?, pay_method = ?, invoice_no = ?, invoice_date = ?, evidence = ?, pit = ?, advance_user_id = ?, version = version + 1 WHERE id = ?`,
       c.date, c.project_id, c.category, c.partner_id, c.description, c.amount_net, c.vat, c.pay_method, c.invoice_no, c.invoice_date, c.evidence, c.pit, c.advance_user_id, id);
     this.audit(user, 'sua', 'chi_phi', before.code, before, c, ip);
     return { ok: true };
   }
-  approveCost({ user, ip }, id) {
+  approveCost({ user, body, ip }, id) {
     this.need(user, APPROVERS);
     const c = this.db.one(`SELECT * FROM costs WHERE id = ?`, id);
     if (!c) throw new HttpError(404, 'Không tìm thấy');
+    checkVersion(body, c.version, 'Khoản chi');
     if (c.status !== 'cho_duyet') throw bad('Khoản chi không ở trạng thái chờ duyệt');
     if (c.created_by === user.id) throw bad('Không được tự duyệt khoản chi do mình lập');
     this.assertOpen(c.date);
-    this.db.run(`UPDATE costs SET status = 'da_duyet', approved_by = ?, approved_at = ? WHERE id = ?`, user.id, vnNow(this.now()), id);
+    this.db.run(`UPDATE costs SET status = 'da_duyet', approved_by = ?, approved_at = ?, version = version + 1 WHERE id = ?`, user.id, vnNow(this.now()), id);
     this.audit(user, 'duyet', 'chi_phi', c.code, { status: c.status }, { status: 'da_duyet' }, ip);
     return { ok: true };
   }
@@ -719,9 +813,10 @@ export class App {
     const c = this.db.one(`SELECT * FROM costs WHERE id = ?`, id);
     if (!c) throw new HttpError(404, 'Không tìm thấy');
     if (!(APPROVERS.includes(user.role) || c.created_by === user.id)) throw new HttpError(403, 'Bạn không có quyền');
+    checkVersion(body, c.version, 'Khoản chi');
     if (c.status !== 'cho_duyet') throw bad('Khoản chi không ở trạng thái chờ duyệt');
     const reason = str(body.reason, { field: 'lý do', required: true, max: 300 });
-    this.db.run(`UPDATE costs SET status = 'tu_choi', reason = ?, approved_by = ?, approved_at = ?, einvoice_key = NULL WHERE id = ?`, reason, user.id, vnNow(this.now()), id);
+    this.db.run(`UPDATE costs SET status = 'tu_choi', reason = ?, approved_by = ?, approved_at = ?, einvoice_key = NULL, version = version + 1 WHERE id = ?`, reason, user.id, vnNow(this.now()), id);
     this.audit(user, 'tu_choi', 'chi_phi', c.code, { status: c.status }, { status: 'tu_choi', reason }, ip);
     return { ok: true };
   }
@@ -746,6 +841,18 @@ export class App {
     this.need(user, BOOKKEEPERS);
     const conf = this.ledgerConf(t);
     const date = body.date;
+    if (t === 'revenues' && body.invoice_no) {
+      const d = this.db.one(`SELECT code FROM revenues WHERE project_id = ? AND lower(invoice_no) = lower(?) AND reverses_id IS NULL AND reversed_by_id IS NULL`, Number(body.project_id), String(body.invoice_no).trim());
+      if (d) throw new HttpError(409, `Hoá đơn số ${body.invoice_no} đã ghi doanh thu ở ${d.code}.`);
+    }
+    if (!body.allow_duplicate) {
+      const since = vnNow(this.now() - 30 * 60000);
+      const amt = t === 'revenues' ? Math.round(Number(String(body.amount_net).replace(/[.\s,đ]/g, '')) || 0) : Math.round(Number(String(body.amount).replace(/[.\s,đ]/g, '')) || 0);
+      const d = t === 'payments'
+        ? this.db.one(`SELECT code FROM payments WHERE date = ? AND partner_id = ? AND amount = ? AND reverses_id IS NULL AND created_at >= ?`, date, Number(body.partner_id), amt, since)
+        : this.db.one(`SELECT code FROM ${t} WHERE date = ? AND project_id = ? AND ${t === 'revenues' ? 'amount_net' : 'amount'} = ? AND reverses_id IS NULL AND created_at >= ?`, date, Number(body.project_id), amt, since);
+      if (d) throw dupError(`Có vẻ trùng với ${d.code} vừa nhập (cùng ngày, cùng đối tượng, cùng số tiền). Vẫn lưu?`);
+    }
     this.assertDate(date, 'Ngày');
     this.assertOpen(date);
     const description = str(body.description, { field: 'nội dung', required: t === 'revenues', max: 500 });
@@ -814,7 +921,7 @@ export class App {
         row = this.db.one(`INSERT INTO costs (code, date, project_id, category, partner_id, description, amount_net, vat, pay_method, invoice_no, invoice_date, evidence, pit, advance_user_id, status, reverses_id, reason, source, created_by, created_at, approved_by, approved_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'da_duyet', ?, ?, 'dao', ?, ?, ?, ?) RETURNING id, code`,
           code, date, o.project_id, o.category, o.partner_id, desc, -o.amount_net, -o.vat, o.pay_method, o.invoice_no, o.invoice_date, o.evidence, -o.pit, o.advance_user_id, o.id, reason, user.id, now, user.id, now);
-        this.db.run(`UPDATE costs SET reversed_by_id = ?, einvoice_key = NULL WHERE id = ?`, row.id, o.id);
+        this.db.run(`UPDATE costs SET reversed_by_id = ?, einvoice_key = NULL, version = version + 1 WHERE id = ?`, row.id, o.id);
       } else if (t === 'revenues') {
         row = this.db.one(`INSERT INTO revenues (code, date, project_id, description, amount_net, vat, invoice_no, status, reverses_id, reason, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'da_duyet', ?, ?, ?, ?) RETURNING id, code`,
           code, date, o.project_id, desc, -o.amount_net, -o.vat, o.invoice_no, o.id, reason, user.id, now);
@@ -961,13 +1068,16 @@ export class App {
   // ---------- dự toán công trình ----------
   saveBudget({ user, body, ip }, id) {
     this.need(user, BOOKKEEPERS);
-    if (!this.db.one(`SELECT id FROM projects WHERE id = ?`, id)) throw new HttpError(404, 'Không tìm thấy công trình');
+    const pj = this.db.one(`SELECT id, version FROM projects WHERE id = ?`, id);
+    if (!pj) throw new HttpError(404, 'Không tìm thấy công trình');
+    checkVersion(body, pj.version, 'Dự toán công trình');
     const lines = body.lines && typeof body.lines === 'object' ? body.lines : {};
     const next = {};
     for (const k of Object.keys(PROJECT_CATEGORIES)) next[k] = toMoney(lines[k] ?? 0, { field: 'Dự toán ' + PROJECT_CATEGORIES[k] });
     const before = this.db.all(`SELECT category, amount FROM budgets WHERE project_id = ?`, id);
     this.db.tx(() => {
       this.db.run(`DELETE FROM budgets WHERE project_id = ?`, id);
+      this.db.run(`UPDATE projects SET version = version + 1 WHERE id = ?`, id);
       Object.entries(next).forEach(([k, v]) => { if (v) this.db.run(`INSERT INTO budgets (project_id, category, amount) VALUES (?, ?, ?)`, id, k, v); });
     });
     this.audit(user, 'du_toan', 'cong_trinh', id, before, next, ip);
@@ -987,6 +1097,11 @@ export class App {
   createAdvance({ user, body, ip }) {
     this.need(user, BOOKKEEPERS);
     const date = body.date;
+    if (!body.allow_duplicate) {
+      const d = this.db.one(`SELECT code FROM advances WHERE date = ? AND user_id = ? AND kind = ? AND amount = ? AND reverses_id IS NULL AND created_at >= ?`,
+        date, Number(body.user_id), String(body.kind), Math.round(Number(String(body.amount).replace(/[.\s,đ]/g, '')) || 0), vnNow(this.now() - 30 * 60000));
+      if (d) throw dupError(`Có vẻ trùng với ${d.code} vừa nhập. Vẫn lưu?`);
+    }
     this.assertDate(date, 'Ngày');
     this.assertOpen(date);
     const userId = Number(body.user_id);

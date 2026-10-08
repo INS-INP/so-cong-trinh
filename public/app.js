@@ -23,15 +23,32 @@ const projCode = (id) => S.boot.projects.find(x => x.id === id)?.code || 'Chung'
 const partnerName = (id) => S.boot.partners.find(x => x.id === id)?.name || '';
 const userName = (id) => S.boot.users.find(x => x.id === id)?.full_name || (id ? `#${id}` : '');
 
+// Mỗi thao tác ghi mang 1 mã chống trùng (x-idem): bấm 2 lần hoặc mạng gửi lại thì máy chủ chỉ thực hiện 1 lần.
+const newIdem = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2, 12)).replace(/[^A-Za-z0-9_-]/g, '');
+let IDEM = null;
 async function api(method, path, body) {
   const opt = { method, headers: { 'x-sct': '1' }, credentials: 'same-origin' };
+  if (method !== 'GET') opt.headers['x-idem'] = IDEM || newIdem();
   if (body !== undefined) { opt.headers['content-type'] = 'application/json'; opt.body = JSON.stringify(body); }
-  const res = await fetch(path, opt);
+  let res;
+  try { res = await fetch(path, opt); } catch {
+    // mất mạng giữa chừng: gửi lại đúng 1 lần với CÙNG mã → nếu lần đầu đã tới máy chủ thì không bị ghi 2 lần
+    await new Promise(r => setTimeout(r, 1500));
+    try { res = await fetch(path, opt); } catch { throw new Error('Mất kết nối mạng. Kiểm tra mạng rồi thử lại (không lo bị ghi trùng).'); }
+  }
   let data = null;
   try { data = await res.json(); } catch { data = {}; }
   if (res.status === 401 && !['/api/login', '/api/setup', '/api/me/password'].includes(path)) { S.boot = null; showAuth(); throw new Error(data.error || 'Cần đăng nhập'); }
-  if (!res.ok) throw new Error(data.error || `Lỗi ${res.status}`);
+  if (res.status === 409 && data.code === 'possible_duplicate' && body && typeof body === 'object') {
+    if (confirm(data.error)) return api(method, path, { ...body, allow_duplicate: true });
+    const e = new Error('Đã huỷ, không lưu.'); e.code = 'cancelled'; throw e;
+  }
+  if (!res.ok) { const e = new Error(data.error || `Lỗi ${res.status}`); e.code = data.code; throw e; }
   return data;
+}
+// Dữ liệu vừa bị người khác sửa → tải lại bản mới nhất.
+async function onConflict(e) {
+  if (e && e.code === 'conflict') { closeModal(); try { await loadBoot(); } catch { /* bỏ qua */ } route(); }
 }
 
 let toastTimer;
@@ -75,12 +92,24 @@ function formValues(form) {
 }
 async function submitting(form, fn) {
   const btn = $('button[type=submit]', form);
+  if (form.dataset.busy === '1') return; // đang gửi: bỏ qua lần bấm thứ 2
+  form.dataset.busy = '1';
   const errBox = $('.form-error', form);
   if (errBox) errBox.hidden = true;
   if (btn) { btn.disabled = true; btn.dataset.label = btn.textContent; btn.textContent = 'Đang lưu…'; }
+  if (!form.dataset.idem) form.dataset.idem = newIdem(); // cùng 1 form = cùng 1 mã, gửi lại không bị ghi trùng
+  IDEM = form.dataset.idem;
   try { await fn(); } catch (e) {
+    if (e.code === 'conflict') { toast(e.message, true); await onConflict(e); return; }
     if (errBox) { errBox.textContent = e.message; errBox.hidden = false; errBox.scrollIntoView({ block: 'nearest' }); } else toast(e.message, true);
-  } finally { if (btn) { btn.disabled = false; btn.textContent = btn.dataset.label; } }
+  } finally { IDEM = null; form.dataset.busy = ''; syncSeq(); if (btn) { btn.disabled = false; btn.textContent = btn.dataset.label; } }
+}
+// Nút thao tác 1 lần (duyệt, huỷ, ký…): khoá nút khi đang gửi.
+async function once(btn, fn) {
+  if (btn && btn.disabled) return;
+  if (btn) btn.disabled = true;
+  IDEM = newIdem();
+  try { await fn(); } catch (e) { toast(e.message, true); await onConflict(e); } finally { IDEM = null; syncSeq(); if (btn) btn.disabled = false; }
 }
 
 // Ảnh chứng từ: tự nén về JPEG ≤1600px để vừa giới hạn lưu trữ, PDF/XML giữ nguyên.
@@ -158,7 +187,7 @@ const NAV = [
   { href: '#/doi-tac', label: 'Nhà cung cấp & khách', roles: ['quan_tri', 'ke_toan'] },
   { href: '#/cai-dat', label: 'Cài đặt & người dùng', roles: ['quan_tri'] },
   { href: '#/cai-ung-dung', label: 'Cài ứng dụng lên máy', roles: ['quan_tri', 'ke_toan', 'chi_huy', 'co_dong'], install: true },
-  { href: '#/tai-khoan', label: 'Đổi mật khẩu', roles: ['quan_tri', 'ke_toan', 'chi_huy', 'co_dong'] },
+  { href: '#/tai-khoan', label: 'Mật khẩu & máy đăng nhập', roles: ['quan_tri', 'ke_toan', 'chi_huy', 'co_dong'] },
   { href: '#/dang-xuat', label: 'Đăng xuất', roles: ['quan_tri', 'ke_toan', 'chi_huy', 'co_dong'] },
 ];
 let pendingCount = 0;
@@ -171,7 +200,9 @@ $('#menuBtn').addEventListener('click', () => $('#sidebar').classList.toggle('op
 $('#sidebar').addEventListener('click', (e) => { if (e.target.closest('a')) $('#sidebar').classList.remove('open'); });
 
 async function loadBoot() {
-  S.boot = await api('GET', '/api/bootstrap');
+  const [boot, ch] = await Promise.all([api('GET', '/api/bootstrap'), api('GET', '/api/changes').catch(() => null)]);
+  S.boot = boot;
+  if (ch) lastSeq = ch.seq;
   $('#companyName').textContent = S.boot.settings.company_name || 'Sổ Công Trình';
   document.title = `Sổ Công Trình — ${S.boot.settings.company_name || ''}`;
   $('#who').textContent = `${me().full_name} · ${C().ROLES[role()]}`;
@@ -200,17 +231,18 @@ const ROUTES = [
   [/^#\/but-toan$/, pageJournals],
   [/^#\/dang-xuat$/, doLogout],
 ];
-async function route() {
+async function route(opts) {
   if (!S.boot) return;
+  const keepScroll = !!(opts && opts.keepScroll), y = window.scrollY;
   const hash = location.hash || '#/';
   renderNav();
   const main = $('#main');
   for (const [re, fn] of ROUTES) {
     const m = re.exec(hash);
     if (m) {
-      main.innerHTML = '<div class="loading">Đang tải…</div>';
+      if (!keepScroll) main.innerHTML = '<div class="loading">Đang tải…</div>';
       try { await fn(main, ...m.slice(1)); } catch (e) { main.innerHTML = `<div class="card"><div class="notice bad">${esc(e.message)}</div></div>`; }
-      window.scrollTo(0, 0);
+      window.scrollTo(0, keepScroll ? y : 0);
       return;
     }
   }
@@ -423,6 +455,7 @@ function costForm(existing) {
       else if (v.pit_exempt) delete v.pit;
       let r;
       if (existing) {
+        v.version = existing.version;
         await api('PUT', `/api/costs/${existing.id}`, v);
         toast('Đã lưu');
       } else {
@@ -572,10 +605,10 @@ async function pageCostDetail(main, id) {
     ${d.lines.length ? `<div class="card"><h2>Chi tiết hàng hoá trên hoá đơn</h2><div class="table-wrap"><table><thead><tr><th>Hàng hoá</th><th>ĐVT</th><th class="num">SL</th><th class="num">Đơn giá</th><th class="num">Thành tiền</th><th>Thuế</th></tr></thead><tbody>
       ${d.lines.map(l => `<tr><td>${esc(l.name)}</td><td>${esc(l.unit)}</td><td class="num">${fmt(l.qty)}</td><td class="num">${fmt(l.price)}</td><td class="num">${fmt(l.amount)}</td><td>${esc(l.vat_rate)}</td></tr>`).join('')}</tbody></table></div></div>` : ''}
     <div class="card"><h2>Lịch sử</h2><ul>${d.history.map(h => `<li>${esc(h.at)} — <b>${esc(userName(h.user_id))}</b>: ${esc(actLabel[h.action] || h.action)}</li>`).join('')}</ul></div>`;
-  const act = async (fn) => { try { await fn(); await refreshPending(); route(); } catch (e) { toast(e.message, true); } };
-  $('#aApprove')?.addEventListener('click', () => act(async () => { await api('POST', `/api/costs/${id}/approve`, {}); toast('Đã duyệt'); }));
-  $('#aReject')?.addEventListener('click', () => { const reason = prompt('Lý do từ chối:'); if (reason) act(async () => { await api('POST', `/api/costs/${id}/reject`, { reason }); toast('Đã từ chối'); }); });
-  $('#aVoid')?.addEventListener('click', () => { const reason = prompt('Lý do huỷ (sẽ lập bút toán đảo, không xoá chứng từ gốc):'); if (reason) act(async () => { const r = await api('POST', `/api/costs/${id}/void`, { reason }); toast(`Đã lập bút toán đảo ${r.code}`); }); });
+  const act = (btn, fn) => once(btn, async () => { await fn(); await refreshPending(); route(); });
+  $('#aApprove')?.addEventListener('click', (e) => act(e.currentTarget, async () => { await api('POST', `/api/costs/${id}/approve`, { version: c.version }); toast('Đã duyệt'); }));
+  $('#aReject')?.addEventListener('click', (e) => { const reason = prompt('Lý do từ chối:'); if (reason) act(e.currentTarget, async () => { await api('POST', `/api/costs/${id}/reject`, { reason, version: c.version }); toast('Đã từ chối'); }); });
+  $('#aVoid')?.addEventListener('click', (e) => { const reason = prompt('Lý do huỷ (sẽ lập bút toán đảo, không xoá chứng từ gốc):'); if (reason) act(e.currentTarget, async () => { const r = await api('POST', `/api/costs/${id}/void`, { reason }); toast(`Đã lập bút toán đảo ${r.code}`); }); });
   $('#aEdit')?.addEventListener('click', () => costForm(c));
   $('#aAddFile').addEventListener('click', () => attachForm('costs', c.id));
 }
@@ -619,7 +652,7 @@ function projectForm(p) {
   $('[data-close]', f).addEventListener('click', closeModal);
   f.addEventListener('submit', (e) => { e.preventDefault(); submitting(f, async () => {
     const v = formValues(f);
-    if (p) await api('PUT', `/api/projects/${p.id}`, v); else await api('POST', '/api/projects', v);
+    if (p) await api('PUT', `/api/projects/${p.id}`, { ...v, version: p.version }); else await api('POST', '/api/projects', v);
     await loadBoot(); closeModal(); toast('Đã lưu'); route();
   }); });
 }
@@ -679,12 +712,12 @@ async function pageProjectDetail(main, id) {
       <div class="form-actions"><button type="button" class="btn" data-close>Huỷ</button><button class="btn primary" type="submit">Xác nhận nghiệm thu</button></div></form>`);
     const f = $('#accForm', body);
     $('[data-close]', f).addEventListener('click', closeModal);
-    f.addEventListener('submit', (e) => { e.preventDefault(); submitting(f, async () => { await api('POST', `/api/projects/${id}/accept`, formValues(f)); await loadBoot(); closeModal(); toast('Đã nghiệm thu'); route(); }); });
+    f.addEventListener('submit', (e) => { e.preventDefault(); submitting(f, async () => { await api('POST', `/api/projects/${id}/accept`, { ...formValues(f), version: p.version }); await loadBoot(); closeModal(); toast('Đã nghiệm thu'); route(); }); });
   });
-  $('#pReopen')?.addEventListener('click', async () => {
+  $('#pReopen')?.addEventListener('click', (ev) => {
     const reason = prompt('Lý do mở lại (huỷ trạng thái nghiệm thu):');
     if (!reason) return;
-    try { await api('POST', `/api/projects/${id}/reopen`, { reason }); await loadBoot(); route(); } catch (e) { toast(e.message, true); }
+    once(ev.currentTarget, async () => { await api('POST', `/api/projects/${id}/reopen`, { reason }); await loadBoot(); route(); });
   });
 }
 
@@ -706,7 +739,7 @@ function bindLedger(root) {
     const [t, id] = b.dataset.void.split(':');
     const reason = prompt('Lý do huỷ (lập bút toán đảo, không xoá chứng từ gốc):');
     if (!reason) return;
-    try { const r = await api('POST', `/api/${t}/${id}/void`, { reason }); toast(`Đã lập bút toán đảo ${r.code}`); route(); } catch (e) { toast(e.message, true); }
+    once(b, async () => { const r = await api('POST', `/api/${t}/${id}/void`, { reason }); toast(`Đã lập bút toán đảo ${r.code}`); route(); });
   }));
   $$('[data-files]', root).forEach(a => a.addEventListener('click', async (e) => {
     e.preventDefault();
@@ -857,14 +890,14 @@ async function pageReport(main) {
         [], ['Cổ đông', 'Tỷ lệ %', 'Phần lãi/lỗ'], ...r.shareholders.map(x => [x.name, x.pct_bp / 100, x.amount]),
       ]);
     });
-    $('#btnLock')?.addEventListener('click', async () => {
+    $('#btnLock')?.addEventListener('click', (ev) => {
       if (!confirm(`Khoá sổ đến hết tháng ${my(mm)}?\n\nSau khi khoá: không ai thêm/sửa chứng từ của tháng này (và các tháng trước). Sai sót chỉ được sửa bằng bút toán điều chỉnh ở tháng sau. Không mở khoá lại được.`)) return;
-      try { const x = await api('POST', '/api/locks', { month: mm }); await loadBoot(); toast(`Đã khoá sổ: ${x.months.map(my).join(', ')}`); load(); } catch (e) { toast(e.message, true); }
+      once(ev.currentTarget, async () => { const x = await api('POST', '/api/locks', { month: mm }); await loadBoot(); toast(`Đã khoá sổ: ${x.months.map(my).join(', ')}`); load(); });
     });
-    $('#btnSign')?.addEventListener('click', async () => {
+    $('#btnSign')?.addEventListener('click', (ev) => {
       const note = prompt(`Ký xác nhận số liệu tháng ${my(mm)}. Ghi chú (không bắt buộc):`, 'Đồng ý số liệu');
       if (note === null) return;
-      try { await api('POST', '/api/signoffs', { month: mm, note }); toast('Đã ký xác nhận'); load(); } catch (e) { toast(e.message, true); }
+      once(ev.currentTarget, async () => { await api('POST', '/api/signoffs', { month: mm, note }); toast('Đã ký xác nhận'); load(); });
     });
   };
   $('#fMonth').addEventListener('change', load);
@@ -933,7 +966,7 @@ async function pagePartners(main) {
     const f = $('#ptForm', body);
     $('[data-close]', f).addEventListener('click', closeModal);
     f.addEventListener('submit', (e) => { e.preventDefault(); submitting(f, async () => {
-      if (p) await api('PUT', `/api/partners/${p.id}`, formValues(f)); else await api('POST', '/api/partners', formValues(f));
+      if (p) await api('PUT', `/api/partners/${p.id}`, { ...formValues(f), version: p.version }); else await api('POST', '/api/partners', formValues(f));
       await loadBoot(); closeModal(); toast('Đã lưu'); route();
     }); });
   };
@@ -971,7 +1004,7 @@ async function pageSettings(main) {
         <p><b>Chỉ huy công trình</b>: chỉ nhập chi phí công trình kèm ảnh chứng từ, chỉ thấy khoản mình nhập; mọi khoản đều chờ duyệt.</p>
         <p><b>Cổ đông</b>: xem toàn bộ sổ sách, báo cáo, nhật ký; duyệt khoản chi; ký xác nhận báo cáo tháng. Không sửa được số liệu.</p></div></div>`;
   const stF = $('#stForm');
-  stF.addEventListener('submit', (e) => { e.preventDefault(); submitting(stF, async () => { await api('PUT', '/api/settings', formValues(stF)); await loadBoot(); toast('Đã lưu cài đặt'); }); });
+  stF.addEventListener('submit', (e) => { e.preventDefault(); submitting(stF, async () => { await api('PUT', '/api/settings', { ...formValues(stF), version: S.boot.settings.version }); await loadBoot(); toast('Đã lưu cài đặt'); }); });
   const rows = $('#shRows');
   const addRow = (name = '', pct = '') => {
     const d = document.createElement('div'); d.className = 'form-grid sh-row';
@@ -983,7 +1016,7 @@ async function pageSettings(main) {
   $('#addSh').addEventListener('click', () => addRow());
   const shF = $('#shForm');
   shF.addEventListener('submit', (e) => { e.preventDefault(); submitting(shF, async () => {
-    await api('PUT', '/api/shareholders', { shareholders: $$('.sh-row', shF).map(r => ({ name: $('.sh-name', r).value, pct: $('.sh-pct', r).value })).filter(x => x.name.trim()) });
+    await api('PUT', '/api/shareholders', { version: S.boot.settings.shareholders_version, shareholders: $$('.sh-row', shF).map(r => ({ name: $('.sh-name', r).value, pct: $('.sh-pct', r).value })).filter(x => x.name.trim()) });
     await loadBoot(); toast('Đã lưu cổ đông');
   }); });
   const userForm = (u) => {
@@ -996,7 +1029,7 @@ async function pageSettings(main) {
     const f = $('#uForm', body);
     $('[data-close]', f).addEventListener('click', closeModal);
     f.addEventListener('submit', (e) => { e.preventDefault(); submitting(f, async () => {
-      if (u) await api('PUT', `/api/users/${u.id}`, formValues(f)); else await api('POST', '/api/users', formValues(f));
+      if (u) await api('PUT', `/api/users/${u.id}`, { ...formValues(f), version: u.version }); else await api('POST', '/api/users', formValues(f));
       await loadBoot(); closeModal(); toast('Đã lưu'); route();
     }); });
   };
@@ -1010,16 +1043,27 @@ async function pageSettings(main) {
 }
 
 async function pageAccount(main) {
-  main.innerHTML = `<div class="page-head"><div><h1>Đổi mật khẩu</h1></div></div><div class="card"><form id="pwForm"><div class="form-error" hidden></div><div class="form-grid">
+  main.innerHTML = `<div class="page-head"><div><h1>Mật khẩu &amp; máy đăng nhập</h1></div></div><div class="card"><form id="pwForm"><div class="form-error" hidden></div><div class="form-grid">
     <div class="full"><label>Mật khẩu hiện tại</label><input type="password" name="old_password" autocomplete="current-password" required></div>
     <div><label>Mật khẩu mới</label><input type="password" name="new_password" autocomplete="new-password" required></div>
     <div><label>Nhập lại mật khẩu mới</label><input type="password" name="new_password2" autocomplete="new-password" required></div>
   </div><div class="form-actions"><button class="btn primary" type="submit">Đổi mật khẩu</button></div></form></div>`;
+  main.insertAdjacentHTML('beforeend', `<div class="card"><h2>Các máy đang đăng nhập tài khoản này</h2><div id="sessBox" class="loading">Đang tải…</div>
+    <div class="actions mt"><button class="btn danger" id="logoutOthers">Đăng xuất tất cả máy khác</button></div>
+    <p class="small muted">Một tài khoản dùng được trên nhiều máy cùng lúc; mọi thao tác ghi đều chống trùng và chống ghi đè. Nếu thấy máy lạ, bấm đăng xuất máy khác rồi đổi mật khẩu.</p></div>`);
+  const loadSess = async () => {
+    const r = await api('GET', '/api/me/sessions');
+    $('#sessBox').className = '';
+    $('#sessBox').innerHTML = `<div class="table-wrap"><table><thead><tr><th>Máy</th><th>Đăng nhập lúc</th><th>Dùng gần nhất</th></tr></thead><tbody>
+      ${r.items.map(x => `<tr><td>${esc(x.device || 'Không rõ')} ${x.current ? '<span class="pill ok">Máy này</span>' : ''}</td><td>${esc(x.created_at)}</td><td>${esc(x.last_seen)}</td></tr>`).join('')}</tbody></table></div>`;
+  };
+  $('#logoutOthers').addEventListener('click', (ev) => { if (confirm('Đăng xuất tài khoản này trên tất cả máy khác?')) once(ev.currentTarget, async () => { const r = await api('POST', '/api/me/logout-others', {}); toast(`Đã đăng xuất ${r.count} máy khác`); loadSess(); }); });
+  loadSess();
   const f = $('#pwForm');
   f.addEventListener('submit', (e) => { e.preventDefault(); submitting(f, async () => {
     const v = formValues(f);
     if (v.new_password !== v.new_password2) throw new Error('Hai lần nhập mật khẩu mới không giống nhau');
-    await api('POST', '/api/me/password', v); f.reset(); toast('Đã đổi mật khẩu');
+    await api('POST', '/api/me/password', v); f.reset(); toast('Đã đổi mật khẩu (các máy khác đã bị đăng xuất)');
   }); });
 }
 
@@ -1202,7 +1246,7 @@ function budgetForm(p, s) {
   const sum = () => { const v = formValues(f); const t = Object.values(v).reduce((a, x) => a + x, 0); $('#bgSum', f).textContent = `Tổng dự toán: ${fmt(t)} đ · Lãi gộp dự kiến: ${fmt(p.contract_value - t)} đ${p.contract_value ? ` (${pctTxt(Math.round((p.contract_value - t) * 10000 / p.contract_value) / 100)})` : ''}`; };
   f.addEventListener('input', sum); sum();
   $('[data-close]', f).addEventListener('click', closeModal);
-  f.addEventListener('submit', (e) => { e.preventDefault(); submitting(f, async () => { await api('PUT', `/api/projects/${p.id}/budget`, { lines: formValues(f) }); toast('Đã lưu dự toán'); closeModal(); route(); }); });
+  f.addEventListener('submit', (e) => { e.preventDefault(); submitting(f, async () => { await api('PUT', `/api/projects/${p.id}/budget`, { lines: formValues(f), version: p.version }); toast('Đã lưu dự toán'); closeModal(); await loadBoot(); route(); }); });
 }
 
 // ---------- Ứng dụng cài trên máy (PWA) + khoá phóng to ----------
@@ -1244,5 +1288,29 @@ async function pageInstall(main) {
     installEvent = null; route();
   });
 }
+
+// Nhiều người/nhiều máy cùng dùng: 20 giây kiểm tra 1 lần có ai vừa ghi gì không; có thì tự tải lại màn hình
+// (không tải lại khi đang mở form hoặc đang gõ — khi đó hiện thông báo để bấm tải lại).
+let lastSeq = null, seqTimer = null;
+// Sau khi chính máy này ghi xong (và đã tải lại màn hình), lấy mốc mới để không tải lại thêm lần nữa.
+function syncSeq() { if (S.boot) api('GET', '/api/changes').then(r => { lastSeq = r.seq; }).catch(() => {}); }
+async function checkChanges() {
+  if (!S.boot || document.visibilityState !== 'visible') return;
+  try {
+    const { seq } = await api('GET', '/api/changes');
+    if (lastSeq === null) { lastSeq = seq; return; }
+    if (seq === lastSeq) return;
+    lastSeq = seq;
+    const busy = !$('#modalBack').hidden || (document.activeElement && document.activeElement.matches('input, textarea, select'));
+    if (busy) { toast('Có người vừa cập nhật dữ liệu. Lưu xong form này rồi số liệu sẽ tự tải lại.'); return; }
+    await loadBoot(); await refreshPending(); route({ keepScroll: true });
+  } catch { /* mất mạng tạm thời: bỏ qua */ }
+}
+function startChangeWatch() {
+  clearInterval(seqTimer);
+  seqTimer = setInterval(checkChanges, 20000);
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') checkChanges(); });
+startChangeWatch();
 
 start();

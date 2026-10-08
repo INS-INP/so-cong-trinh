@@ -74,6 +74,14 @@ export const MIGRATIONS = [
      id INTEGER PRIMARY KEY, journal_id INTEGER NOT NULL, acc TEXT NOT NULL, obj TEXT NOT NULL DEFAULT '',
      debit INTEGER NOT NULL DEFAULT 0, credit INTEGER NOT NULL DEFAULT 0);
    CREATE INDEX IF NOT EXISTS idx_jl ON journal_lines(journal_id)`,
+  // 3: nhiều người/nhiều máy cùng lúc — số phiên bản chống ghi đè, khoá chống gửi trùng, theo dõi phiên đăng nhập.
+  `ALTER TABLE costs ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+   ALTER TABLE projects ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+   ALTER TABLE partners ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+   ALTER TABLE users ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+   ALTER TABLE sessions ADD COLUMN device TEXT NOT NULL DEFAULT '';
+   ALTER TABLE sessions ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0;
+   CREATE TABLE IF NOT EXISTS idempotency (key TEXT PRIMARY KEY, user_id INTEGER NOT NULL, status INTEGER NOT NULL, body TEXT NOT NULL DEFAULT '', at INTEGER NOT NULL)`,
 ];
 
 export function migrate(db) {

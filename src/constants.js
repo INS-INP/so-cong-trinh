@@ -50,4 +50,6 @@ export const DEFAULT_SETTINGS = {
   cash_limit: '5000000',
   pit_rate: '10',
   pit_threshold: '2000000',
+  version: '1',
+  shareholders_version: '1',
 };

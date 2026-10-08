@@ -28,6 +28,14 @@ Phần mềm kế toán và bóc tách chi phí cho công ty thi công. Chạy t
 - Xuất Excel (CSV), in/PDF báo cáo. Dùng tốt trên điện thoại.
 - **Cài như ứng dụng (PWA)**: menu "Cài ứng dụng lên máy" hướng dẫn cho iPhone (Safari → Chia sẻ → Thêm vào MH chính), Android và máy tính. Khoá phóng to khi dùng trên điện thoại.
 
+## Nhiều người, nhiều máy dùng cùng lúc
+- Mỗi người một tài khoản riêng (cổ đông, kế toán, chỉ huy…), tạo ở **Cài đặt & người dùng**. Một tài khoản đăng nhập được nhiều máy; xem và đăng xuất máy khác ở **Mật khẩu & máy đăng nhập**.
+- Dữ liệu lưu theo **từng dòng chứng từ** trong 1 cơ sở dữ liệu duy nhất xử lý tuần tự, nên hai người lưu cùng lúc không bao giờ đè dữ liệu của nhau.
+- **Chống gửi trùng**: mỗi lần bấm lưu mang 1 mã riêng; bấm nhiều lần, mạng chập chờn gửi lại hay 2 máy gửi cùng lúc thì chỉ ghi 1 lần.
+- **Chống ghi đè**: sửa khoản chi, công trình, dự toán, đối tác, người dùng, cài đặt đều kèm số phiên bản; nếu người khác vừa sửa trước thì từ chối và tải lại bản mới.
+- **Chống nhập trùng chứng từ**: cùng nhà cung cấp + cùng số hoá đơn bị chặn; khoản giống hệt vừa nhập trong 30 phút thì hỏi lại.
+- **Tự cập nhật**: 20 giây kiểm tra 1 lần, ai vừa ghi gì thì màn hình người khác tự tải lại (không làm mất form đang nhập dở).
+
 ## Vai trò
 | Vai trò | Quyền |
 |---|---|
